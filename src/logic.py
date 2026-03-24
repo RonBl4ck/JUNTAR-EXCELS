@@ -107,15 +107,15 @@ def extract_table_from_file(file_path, lcl_name):
 
     return found_rows
 
-def process_stage1_by_subfolders():
+def process_stage1_by_subfolders(input_dir, output_dir):
     """
-    Stage 1: Find subfolders in STAGE1_RAW_DIR and process each as a batch.
+    Stage 1: Find subfolders in input_dir and process each as a batch.
     Returns a list of successfully processed folder paths for cleaning.
     """
-    subfolders = [f.path for f in os.scandir(settings.STAGE1_RAW_DIR) if f.is_dir()]
+    subfolders = [f.path for f in os.scandir(input_dir) if f.is_dir()]
     
     if not subfolders:
-        print("No se encontraron subcarpetas de lotes en data/stage1_raw.")
+        print(f"No se encontraron subcarpetas de lotes en {input_dir}.")
         return [], False
 
     print(f"Se encontraron {len(subfolders)} subcarpetas para procesar.")
@@ -192,7 +192,7 @@ def process_stage1_by_subfolders():
                 except Exception as e:
                     print(f" [Advertencia] No se pudo limpiar la columna '{col}': {e}")
         
-        output_path = os.path.join(settings.STAGE2_PROCESSED_DIR, f"{batch_name}.xlsx")
+        output_path = os.path.join(output_dir, f"{batch_name}.xlsx")
         try:
             df_batch.to_excel(output_path, index=False)
             print(f"\n[ÉXITO] Lote '{batch_name}' guardado en: {output_path}")
@@ -204,14 +204,14 @@ def process_stage1_by_subfolders():
 
     return successfully_processed_folders, overall_success
 
-def process_stage2_consolidation():
+def process_stage2_consolidation(input_dir, output_file_path, filter_by_tipo):
     """
-    Stage 2: Consolidate all files from stage2, add 'Tipo_Obra' column, and enrich with Master.
+    Stage 2: Consolidate all files from the input directory, with an option to filter by 'Tipo'.
     """
-    input_files = glob.glob(os.path.join(settings.STAGE2_PROCESSED_DIR, "*.xlsx"))
+    input_files = glob.glob(os.path.join(input_dir, "*.xlsx"))
     
     if not input_files:
-        print("No hay archivos procesados en data/stage2_processed_work_types.")
+        print(f"No hay archivos procesados en {input_dir}.")
         return False
 
     print("--- Unificando Lotes ---")
@@ -219,72 +219,41 @@ def process_stage2_consolidation():
     for file_path in input_files:
         try:
             df = pd.read_excel(file_path)
+            
+            # Filter by 'Tipo' if the option is selected
+            if filter_by_tipo:
+                # Ensure 'Tipo' column exists
+                if 'Tipo' in df.columns:
+                    original_rows = len(df)
+                    df = df[df['Tipo'] == 'Materiales']
+                    print(f" [FILTRO] Lote '{os.path.basename(file_path)}': {len(df)} de {original_rows} filas son 'Materiales'.")
+                else:
+                    print(f" [ADVERTENCIA] La columna 'Tipo' no se encontró en '{os.path.basename(file_path)}', no se pudo filtrar.")
+
             # Add 'Tipo_Obra' column based on filename (e.g., 'DD001')
             batch_name = os.path.splitext(os.path.basename(file_path))[0]
             df.insert(0, "Tipo_Obra", batch_name)
+            
             dfs.append(df)
             print(f" [OK] Leído lote: {batch_name} ({len(df)} filas)")
         except Exception as e:
             print(f" [Error] Falló al leer {os.path.basename(file_path)}: {e}")
 
     if not dfs:
+        print("No se encontraron datos para consolidar (después de filtrar).")
         return False
 
-    # 1. Consolidate
+    # Consolidate
     df_consolidated = pd.concat(dfs, ignore_index=True)
     print(f"\nTotal consolidado: {len(df_consolidated)} filas.")
 
-    # 2. Enrich
-    print("--- Enriqueciendo con Maestra ---")
-    if not os.path.exists(settings.MASTER_FILE):
-        print(f"[ERROR] No se encuentra el archivo maestro en: {settings.MASTER_FILE}")
-        return False
-
     try:
-        df_master = pd.read_excel(settings.MASTER_FILE)
-        # Clean columns
-        df_consolidated.columns = [str(c).strip() for c in df_consolidated.columns]
-        df_master.columns = [str(c).strip() for c in df_master.columns]
-        
-        # Ensure key columns are strings
-        df_consolidated[settings.PROCESS_KEY_COL] = df_consolidated[settings.PROCESS_KEY_COL].astype(str).str.strip()
-        
-        # Check if master key exists
-        if settings.MASTER_KEY_COL not in df_master.columns:
-             print(f"[ERROR] Columna '{settings.MASTER_KEY_COL}' no encontrada en la Maestra.")
-             print(f"Columnas disponibles: {list(df_master.columns)}")
-             return False
-             
-        df_master[settings.MASTER_KEY_COL] = df_master[settings.MASTER_KEY_COL].astype(str).str.strip()
-
-        # Select columns to add
-        cols_to_add = [c for c in settings.MASTER_COLS_TO_ADD if c in df_master.columns]
-        
-        # Prepare master subset (unique keys)
-        df_master_subset = df_master[[settings.MASTER_KEY_COL] + cols_to_add].drop_duplicates(subset=settings.MASTER_KEY_COL)
-
-        # Merge
-        df_final = pd.merge(
-            df_consolidated,
-            df_master_subset,
-            left_on=settings.PROCESS_KEY_COL,
-            right_on=settings.MASTER_KEY_COL,
-            how='left'
-        )
-
         # Save Final Output
-        df_final.to_excel(settings.OUTPUT_FILE, index=False)
-        print(f"\n[ÉXITO] Archivo final guardado en: {settings.OUTPUT_FILE}")
-        
-        # Report missing matches
-        missing = df_final[df_final[cols_to_add[0]].isna()] if cols_to_add else []
-        if len(missing) > 0:
-            print(f"Advertencia: {len(missing)} filas no encontraron coincidencia en la Maestra.")
-
+        df_consolidated.to_excel(output_file_path, index=False)
+        print(f"\n[ÉXITO] Archivo final guardado en: {output_file_path}")
         return True
-
     except Exception as e:
-        print(f"[ERROR] Falló el enriquecimiento: {e}")
+        print(f"[ERROR] Falló al guardar el archivo consolidado: {e}")
         return False
 
 def _read_file_to_df(file_path):

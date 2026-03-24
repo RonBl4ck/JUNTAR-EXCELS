@@ -10,7 +10,6 @@ import pandas as pd
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from src import logic
-from config import settings
 
 class ConsoleRedirector:
     """Redirects stdout/stderr to a Tkinter widget"""
@@ -49,6 +48,12 @@ class App:
         self.enrich_side_file_headers = []
         self.enrich_col_search_var = tk.StringVar()
 
+        # --- Class variables for main process ---
+        self.stage1_input_dir = tk.StringVar(value="")
+        self.stage1_output_dir = tk.StringVar(value="")
+        self.stage2_input_dir = tk.StringVar(value="")
+        self.stage2_filter_by_tipo_var = tk.BooleanVar()
+
         # Main container for tabs
         notebook = ttk.Notebook(root)
         notebook.pack(pady=10, padx=10, fill="x", expand=False)
@@ -82,20 +87,29 @@ class App:
         # Frame and widgets for the main process (Stages 1 & 2)
         frame1 = ttk.LabelFrame(parent_tab, text=" ETAPA 1: Procesar Lotes por Carpetas ", padding=10)
         frame1.pack(fill="x", padx=10, pady=5)
-        ttk.Label(frame1, text="Coloque los archivos en subcarpetas dentro de 'data/stage1_raw'.").pack(anchor="w")
+
+        # Stage 1 - Input
+        ttk.Button(frame1, text="Seleccionar Carpeta de Entrada (Lotes)", command=lambda: self._select_dir(self.stage1_input_dir)).pack(fill="x", pady=(0, 2))
+        ttk.Label(frame1, textvariable=self.stage1_input_dir, foreground="blue", wraplength=550).pack(fill="x", padx=5, pady=(0, 5))
+
+        # Stage 1 - Output
+        ttk.Button(frame1, text="Seleccionar Carpeta de Destino (Lotes Procesados)", command=lambda: self._select_dir(self.stage1_output_dir)).pack(fill="x", pady=(5, 2))
+        ttk.Label(frame1, textvariable=self.stage1_output_dir, foreground="blue", wraplength=550).pack(fill="x", padx=5, pady=(0,10))
+        
         self.clean_folder_var = tk.BooleanVar()
         ttk.Checkbutton(frame1, text="Limpiar subcarpetas de entrada al terminar", variable=self.clean_folder_var).pack(anchor="w", pady=5)
         ttk.Button(frame1, text="PROCESAR LOTES POR CARPETAS", command=self.run_stage1).pack(fill="x", pady=5)
 
         frame2 = ttk.LabelFrame(parent_tab, text=" ETAPA 2: Unificación Final ", padding=10)
         frame2.pack(fill="x", padx=10, pady=5)
-        ttk.Label(frame2, text="Une todos los lotes procesados y cruza con la Maestra.").pack(anchor="w")
-        ttk.Button(frame2, text="GENERAR MASTER FINAL", command=self.run_stage2).pack(fill="x", pady=10)
 
-        frame3 = ttk.LabelFrame(parent_tab, text=" Accesos Rápidos ", padding=10)
-        frame3.pack(fill="x", padx=10, pady=5)
-        ttk.Button(frame3, text="Abrir Carpeta Entrada (Stage 1)", command=lambda: os.startfile(settings.STAGE1_RAW_DIR)).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(frame3, text="Abrir Carpeta Salida Final", command=lambda: os.startfile(settings.OUTPUT_DIR)).pack(side="left", expand=True, fill="x", padx=2)
+        # Stage 2 - Input
+        ttk.Button(frame2, text="Seleccionar Carpeta de Lotes Procesados", command=lambda: self._select_dir(self.stage2_input_dir)).pack(fill="x", pady=(0, 2))
+        ttk.Label(frame2, textvariable=self.stage2_input_dir, foreground="blue", wraplength=550).pack(fill="x", padx=5, pady=(0, 5))
+
+        ttk.Checkbutton(frame2, text="Filtrar por 'Materiales' en la columna 'Tipo'", variable=self.stage2_filter_by_tipo_var).pack(anchor="w", pady=5)
+
+        ttk.Button(frame2, text="UNIR LOTES Y GUARDAR", command=self.run_stage2).pack(fill="x", pady=10)
 
     def _create_enrich_tab(self, parent_tab):
         # Frame and widgets for the enrichment tool
@@ -141,6 +155,20 @@ class App:
         f_run = ttk.Frame(parent_tab, padding=10)
         f_run.pack(fill="x", padx=10, pady=5)
         ttk.Button(f_run, text="ENRIQUECER Y GUARDAR ARCHIVO", command=self._run_enrich_process).pack(fill="x")
+
+    def _select_dir(self, string_var):
+        dir_path = filedialog.askdirectory(title="Seleccionar Carpeta")
+        if dir_path:
+            string_var.set(dir_path)
+
+    def _select_file(self, string_var, is_master=False):
+        title = "Seleccionar Archivo Maestro" if is_master else "Seleccionar Archivo"
+        file_path = filedialog.askopenfilename(
+            title=title,
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if file_path:
+            string_var.set(file_path)
 
     def _get_file_headers(self, file_path):
         if not file_path or not os.path.exists(file_path):
@@ -252,18 +280,25 @@ class App:
             messagebox.showerror("Error", "Falló el proceso de enriquecimiento. Revise el registro de actividad para más detalles.")
 
     def run_stage1(self):
-        print(f"\n--- INICIANDO PROCESO DE LOTES POR CARPETAS ---")
-        threading.Thread(target=self._process_stage1_thread, daemon=True).start()
+        input_dir = self.stage1_input_dir.get()
+        output_dir = self.stage1_output_dir.get()
 
-    def _process_stage1_thread(self):
-        processed_folders, success = logic.process_stage1_by_subfolders()
+        if not os.path.isdir(input_dir) or not os.path.isdir(output_dir):
+            messagebox.showerror("Error de Ruta", "Por favor, seleccione una carpeta de entrada y de destino válidas para la Etapa 1.")
+            return
+
+        print(f"\n--- INICIANDO PROCESO DE LOTES POR CARPETAS ---")
+        threading.Thread(target=self._process_stage1_thread, args=(input_dir, output_dir), daemon=True).start()
+
+    def _process_stage1_thread(self, input_dir, output_dir):
+        processed_folders, success = logic.process_stage1_by_subfolders(input_dir, output_dir)
         
         if self.clean_folder_var.get() and processed_folders:
             print("\n--- Limpiando subcarpetas procesadas ---")
             for folder_path in processed_folders:
                 print(f"Limpiando carpeta: {os.path.basename(folder_path)}")
                 try:
-                    import glob
+                    # Use glob to be safe
                     files_to_delete = glob.glob(os.path.join(folder_path, "*"))
                     for f in files_to_delete:
                         os.remove(f)
@@ -279,15 +314,30 @@ class App:
         print("--- Fin del proceso ---")
 
     def run_stage2(self):
-        print(f"\n--- INICIANDO GENERACIÓN MASTER FINAL ---")
-        threading.Thread(target=self._process_stage2_thread, daemon=True).start()
+        input_dir = self.stage2_input_dir.get()
+        filter_by_tipo = self.stage2_filter_by_tipo_var.get()
 
-    def _process_stage2_thread(self):
-        success = logic.process_stage2_consolidation()
+        if not os.path.isdir(input_dir):
+            messagebox.showerror("Error de Ruta", "Por favor, seleccione una carpeta de lotes válidos.")
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            title="Guardar Archivo Unificado Como...",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")]
+        )
+        if not output_path:
+            return
+
+        print(f"\n--- INICIANDO UNIFICACIÓN DE LOTES ---")
+        threading.Thread(target=self._process_stage2_thread, args=(input_dir, output_path, filter_by_tipo), daemon=True).start()
+
+    def _process_stage2_thread(self, input_dir, output_path, filter_by_tipo):
+        success = logic.process_stage2_consolidation(input_dir, output_path, filter_by_tipo)
         if success:
-            messagebox.showinfo("Éxito", "Master Final generado y enriquecido.")
+            messagebox.showinfo("Éxito", f"Archivo unificado guardado en:\n{output_path}")
         else:
-            messagebox.showerror("Error", "No se pudo generar el Master Final.")
+            messagebox.showerror("Error", "No se pudo generar el archivo unificado.")
         print("--- Fin del proceso ---")
 
 if __name__ == "__main__":
