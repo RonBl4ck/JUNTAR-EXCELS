@@ -1,11 +1,231 @@
-import pandas as pd
-import os
 import glob
-import warnings
+import os
 import re
+import warnings
+
+import pandas as pd
+
 from config import settings
 
-warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl") 
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+NUMERIC_OUTPUT_COLUMNS = [
+    "Cantidad",
+    "Precio unitario eD",
+    "Precio unitario cliente",
+    "Precio total eD",
+    "Precio total cliente",
+]
+
+CONSISTENCY_NUMERIC_COLUMNS = [
+    "Cantidad",
+    "Precio unitario eD",
+    "Precio total eD",
+]
+
+CONSISTENCY_TOLERANCE = 0.01
+
+
+def _normalize_mixed_number(value):
+    """Normalize strings with mixed decimal separators into a float."""
+    if pd.isna(value):
+        return pd.NA
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return pd.NA
+
+    text = text.replace(" ", "")
+
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "")
+            text = text.replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(".", "")
+        text = text.replace(",", ".")
+    else:
+        if text.count(".") > 1:
+            parts = text.split(".")
+            text = "".join(parts[:-1]) + "." + parts[-1]
+
+    text = re.sub(r"[^0-9.\-+]", "", text)
+    if text in {"", "-", "+", ".", "-.", "+."}:
+        return pd.NA
+
+    try:
+        return float(text)
+    except ValueError:
+        return pd.NA
+
+
+def _parse_number_variant(value, decimal_mode):
+    if pd.isna(value):
+        return pd.NA
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return pd.NA
+
+    text = text.replace(" ", "")
+    text = re.sub(r"[^0-9,.\-+]", "", text)
+    if text in {"", "-", "+", ".", ",", "-.", "+.", "-,", "+,"}:
+        return pd.NA
+
+    if decimal_mode == "comma":
+        text = text.replace(".", "")
+        text = text.replace(",", ".")
+    elif decimal_mode == "dot":
+        text = text.replace(",", "")
+    else:
+        return pd.NA
+
+    try:
+        return float(text)
+    except ValueError:
+        return pd.NA
+
+
+def _candidate_values_for_quantity(value):
+    candidates = []
+    for mode in ("comma", "dot"):
+        parsed = _parse_number_variant(value, mode)
+        if pd.notna(parsed):
+            candidates.append((mode, float(parsed)))
+
+    fallback = _normalize_mixed_number(value)
+    if pd.notna(fallback):
+        fallback_value = float(fallback)
+        if not any(abs(candidate - fallback_value) <= 1e-12 for _, candidate in candidates):
+            candidates.append(("mixed", fallback_value))
+
+    return candidates
+
+
+def _relative_error(expected, actual):
+    scale = max(abs(expected), abs(actual), 1.0)
+    return abs(expected - actual) / scale
+
+
+def _choose_consistent_triplet(row, row_number=None):
+    raw_qty = row.get("Cantidad", pd.NA)
+    raw_unit = row.get("Precio unitario eD", pd.NA)
+    raw_total = row.get("Precio total eD", pd.NA)
+
+    best = None
+    for price_mode in ("comma", "dot"):
+        unit = _parse_number_variant(raw_unit, price_mode)
+        total = _parse_number_variant(raw_total, price_mode)
+        if pd.isna(unit) or pd.isna(total):
+            continue
+        if abs(unit) <= 1e-12:
+            continue
+
+        expected_qty = total / unit
+        qty_candidates = _candidate_values_for_quantity(raw_qty)
+        for qty_mode, qty in qty_candidates:
+            error = _relative_error(expected_qty, qty)
+            candidate = {
+                "price_mode": price_mode,
+                "qty_mode": qty_mode,
+                "Cantidad": qty,
+                "Precio unitario eD": unit,
+                "Precio total eD": total,
+                "error": error,
+                "expected_qty": expected_qty,
+            }
+            if best is None or candidate["error"] < best["error"]:
+                best = candidate
+
+    if best is None:
+        return row
+
+    updated_row = row.copy()
+    updated_row["Cantidad"] = best["Cantidad"]
+    updated_row["Precio unitario eD"] = best["Precio unitario eD"]
+    updated_row["Precio total eD"] = best["Precio total eD"]
+
+    if best["error"] > CONSISTENCY_TOLERANCE and row_number is not None:
+        print(
+            f" [ADVERTENCIA] Fila {row_number}: no se pudo reconciliar bien "
+            f"Cantidad/Unitario/Total (error relativo {best['error']:.4f})."
+        )
+    elif best["qty_mode"] != "mixed" and row_number is not None:
+        original_qty = str(raw_qty).strip()
+        resolved_qty = best["Cantidad"]
+        expected_qty = best["expected_qty"]
+        if pd.notna(raw_qty) and abs(resolved_qty - expected_qty) <= CONSISTENCY_TOLERANCE:
+            print(
+                f" [HEURISTICA] Fila {row_number}: cantidad '{original_qty}' "
+                f"interpretada como {resolved_qty:g} usando precios en formato {best['price_mode']}."
+            )
+
+    return updated_row
+
+
+def _resolve_numeric_consistency(df):
+    required_cols = [col for col in CONSISTENCY_NUMERIC_COLUMNS if col in df.columns]
+    if len(required_cols) < len(CONSISTENCY_NUMERIC_COLUMNS):
+        return _normalize_numeric_columns(df)
+
+    resolved_rows = []
+    for idx, (_, row) in enumerate(df.iterrows(), start=2):
+        resolved_rows.append(_choose_consistent_triplet(row, row_number=idx))
+
+    resolved_df = pd.DataFrame(resolved_rows, columns=df.columns)
+
+    remaining_cols = [col for col in NUMERIC_OUTPUT_COLUMNS if col not in CONSISTENCY_NUMERIC_COLUMNS]
+    resolved_df = _normalize_numeric_columns(resolved_df, remaining_cols)
+    return resolved_df
+
+
+def _safe_resolve_numeric_consistency(df, context_label=""):
+    try:
+        return _resolve_numeric_consistency(df)
+    except Exception as e:
+        label = f" en {context_label}" if context_label else ""
+        print(
+            f" [ADVERTENCIA] Fallo la heuristica numerica{label}: {e}. "
+            "Se usara normalizacion simple."
+        )
+        return _normalize_numeric_columns(df.copy())
+
+
+def _normalize_numeric_columns(df, numeric_columns=None):
+    numeric_columns = numeric_columns or NUMERIC_OUTPUT_COLUMNS
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = df[col].apply(_normalize_mixed_number)
+    return df
+
+
+def _format_number_with_comma(value):
+    if pd.isna(value):
+        return ""
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    text = f"{value:.15g}"
+    return text.replace(".", ",")
+
+
+def _apply_numeric_output_format(df, output_numeric_format, numeric_columns=None):
+    numeric_columns = numeric_columns or NUMERIC_OUTPUT_COLUMNS
+    if output_numeric_format == "comma_text":
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = df[col].apply(_format_number_with_comma)
+    return df
+
 
 def extract_table_from_file(file_path, lcl_name):
     """
@@ -17,21 +237,21 @@ def extract_table_from_file(file_path, lcl_name):
     file_ext = os.path.splitext(file_path)[1].lower()
 
     try:
-        # --- CSV Processing ---
-        if file_ext == '.csv':
-            # For CSV, we read the whole file and then find the table
-            # Try with different encodings and delimiters if needed
+        if file_ext == ".csv":
             try:
-                df = pd.read_csv(file_path, header=None, encoding='utf-8', sep=';')
+                df = pd.read_csv(file_path, header=None, encoding="utf-8", sep=";")
             except (UnicodeDecodeError, pd.errors.ParserError):
                 try:
-                    df = pd.read_csv(file_path, header=None, encoding='latin1', sep=';')
+                    df = pd.read_csv(file_path, header=None, encoding="latin1", sep=";")
                 except pd.errors.ParserError:
                     try:
-                        df = pd.read_csv(file_path, header=None, encoding='utf-8', sep=',')
+                        df = pd.read_csv(file_path, header=None, encoding="utf-8", sep=",")
                     except Exception as e:
-                         print(f"Warning: Could not parse CSV {os.path.basename(file_path)} with any common format: {e}")
-                         return []
+                        print(
+                            f"Warning: Could not parse CSV {os.path.basename(file_path)} "
+                            f"with any common format: {e}"
+                        )
+                        return []
 
             if df.shape[1] < 2:
                 return []
@@ -48,27 +268,26 @@ def extract_table_from_file(file_path, lcl_name):
                     if df.shape[1] < 1 + expected_cols_count:
                         i += 1
                         continue
-                    
+
                     current_row = i + 1
                     while current_row < len(df):
                         val_b = df.iloc[current_row, 1]
                         if pd.isna(val_b) or str(val_b).strip() == "":
                             break
-                        
-                        raw_data = df.iloc[current_row, 1:1+expected_cols_count].tolist()
+
+                        raw_data = df.iloc[current_row, 1 : 1 + expected_cols_count].tolist()
                         found_rows.append([lcl_name] + raw_data)
                         current_row += 1
                     i = current_row
                     continue
                 i += 1
-        
-        # --- Excel Processing ---
-        elif file_ext in ['.xlsx', '.xls']:
+
+        elif file_ext in [".xlsx", ".xls"]:
             xls = pd.ExcelFile(file_path)
             for sheet_name in xls.sheet_names:
                 try:
                     df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-                    
+
                     if df.shape[1] < 2:
                         continue
 
@@ -84,14 +303,14 @@ def extract_table_from_file(file_path, lcl_name):
                             if df.shape[1] < 1 + expected_cols_count:
                                 i += 1
                                 continue
-                            
+
                             current_row = i + 1
                             while current_row < len(df):
                                 val_b = df.iloc[current_row, 1]
                                 if pd.isna(val_b) or str(val_b).strip() == "":
                                     break
-                                
-                                raw_data = df.iloc[current_row, 1:1+expected_cols_count].tolist()
+
+                                raw_data = df.iloc[current_row, 1 : 1 + expected_cols_count].tolist()
                                 found_rows.append([lcl_name] + raw_data)
                                 current_row += 1
                             i = current_row
@@ -99,7 +318,10 @@ def extract_table_from_file(file_path, lcl_name):
                         i += 1
 
                 except Exception as e:
-                    print(f"Warning: Error reading sheet '{sheet_name}' in {os.path.basename(file_path)}: {e}")
+                    print(
+                        f"Warning: Error reading sheet '{sheet_name}' in "
+                        f"{os.path.basename(file_path)}: {e}"
+                    )
 
     except Exception as e:
         print(f"Error reading file {os.path.basename(file_path)}: {e}")
@@ -107,13 +329,14 @@ def extract_table_from_file(file_path, lcl_name):
 
     return found_rows
 
-def process_stage1_by_subfolders(input_dir, output_dir):
+
+def process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format="excel"):
     """
     Stage 1: Find subfolders in input_dir and process each as a batch.
     Returns a list of successfully processed folder paths for cleaning.
     """
     subfolders = [f.path for f in os.scandir(input_dir) if f.is_dir()]
-    
+
     if not subfolders:
         print(f"No se encontraron subcarpetas de lotes en {input_dir}.")
         return [], False
@@ -126,76 +349,67 @@ def process_stage1_by_subfolders(input_dir, output_dir):
         batch_name = os.path.basename(folder_path)
         print(f"\n--- Procesando Lote: {batch_name} ---")
 
-        input_files = glob.glob(os.path.join(folder_path, "*.xlsx")) + \
-                      glob.glob(os.path.join(folder_path, "*.xls")) + \
-                      glob.glob(os.path.join(folder_path, "*.csv"))
-        
+        input_files = (
+            glob.glob(os.path.join(folder_path, "*.xlsx"))
+            + glob.glob(os.path.join(folder_path, "*.xls"))
+            + glob.glob(os.path.join(folder_path, "*.csv"))
+        )
+
         if not input_files:
             print(f" [!] No se encontraron archivos Excel o CSV en la carpeta '{batch_name}'.")
             continue
 
         print(f"Procesando {len(input_files)} archivos para el lote '{batch_name}'...")
-        
+
         all_rows = []
         for file_path in input_files:
             filename = os.path.basename(file_path)
             name_no_ext = os.path.splitext(filename)[0]
 
-            if 'lcl' in name_no_ext.lower():
-                # Find all sequences of digits
-                numbers = re.findall(r'\d+', name_no_ext)
+            if "lcl" in name_no_ext.lower():
+                numbers = re.findall(r"\d+", name_no_ext)
                 if numbers:
-                    # Assume the longest number is the one we want (to distinguish from LCL1, LCL2 etc)
                     lcl_name = max(numbers, key=len)
                 else:
-                    # Fallback if 'LCL' is in the name but no numbers are found
-                    lcl_name = name_no_ext.split('-')[0].strip()
+                    lcl_name = name_no_ext.split("-")[0].strip()
             else:
-                # Original logic for names that do not contain 'LCL'
-                lcl_name = name_no_ext.split('-')[0].strip()
-            
+                lcl_name = name_no_ext.split("-")[0].strip()
+
             rows = extract_table_from_file(file_path, lcl_name)
             if rows:
                 all_rows.extend(rows)
                 print(f" [OK] {filename} -> {len(rows)} filas (LCL: {lcl_name})")
             else:
-                print(f" [!] {filename} -> No se encontró tabla válida")
+                print(f" [!] {filename} -> No se encontro tabla valida")
 
         if not all_rows:
-            print(f"No se extrajeron datos de ningún archivo en el lote '{batch_name}'.")
+            print(f"No se extrajeron datos de ningun archivo en el lote '{batch_name}'.")
             continue
 
         headers = [
-            "LCL_Origen", "Tipo", "Contador", "Mat./Prest.", "Descripción Mat./Serv.", 
-            "Cantidad", "Unidad medida base", "Imputación", 
-            "Precio unitario eD", "Precio unitario cliente", 
-            "Precio total eD", "Precio total cliente"
+            "LCL_Origen",
+            "Tipo",
+            "Contador",
+            "Mat./Prest.",
+            "Descripcion Mat./Serv.",
+            "Cantidad",
+            "Unidad medida base",
+            "Imputacion",
+            "Precio unitario eD",
+            "Precio unitario cliente",
+            "Precio total eD",
+            "Precio total cliente",
         ]
 
         df_batch = pd.DataFrame(all_rows, columns=headers)
 
-        # --- Data Cleaning ---
-        # Convert columns with comma decimals to dot decimals
-        cols_to_clean = [
-            "Cantidad", "Precio unitario eD", "Precio unitario cliente", 
-            "Precio total eD", "Precio total cliente"
-        ]
-        print("Limpiando datos numéricos (reemplazando comas)...")
-        for col in cols_to_clean:
-            if col in df_batch.columns:
-                try:
-                    # Ensure column is string, replace comma, then convert to numeric
-                    df_batch[col] = pd.to_numeric(
-                        df_batch[col].astype(str).str.replace(',', '.'),
-                        errors='coerce' # Invalid parsing will be set as NaT
-                    )
-                except Exception as e:
-                    print(f" [Advertencia] No se pudo limpiar la columna '{col}': {e}")
-        
         output_path = os.path.join(output_dir, f"{batch_name}.xlsx")
         try:
+            print("Normalizando columnas numericas con heuristica por fila...")
+            df_batch = _safe_resolve_numeric_consistency(df_batch, context_label=f"lote {batch_name}")
+            df_batch = _apply_numeric_output_format(df_batch, output_numeric_format)
             df_batch.to_excel(output_path, index=False)
-            print(f"\n[ÉXITO] Lote '{batch_name}' guardado en: {output_path}")
+            print(f"\n[EXITO] Lote '{batch_name}' guardado en: {output_path}")
             print(f"Total filas: {len(df_batch)}")
             overall_success = True
             successfully_processed_folders.append(folder_path)
@@ -204,78 +418,103 @@ def process_stage1_by_subfolders(input_dir, output_dir):
 
     return successfully_processed_folders, overall_success
 
-def process_stage2_consolidation(input_dir, output_file_path, filter_by_tipo):
+
+def process_stage2_consolidation(
+    input_dir,
+    output_file_path,
+    filter_column=None,
+    allowed_values=None,
+    output_numeric_format="excel",
+):
     """
-    Stage 2: Consolidate all files from the input directory, with an option to filter by 'Tipo'.
+    Stage 2: Consolidate all files from the input directory with an optional
+    filter by column and allowed values.
     """
     input_files = glob.glob(os.path.join(input_dir, "*.xlsx"))
-    
+
     if not input_files:
         print(f"No hay archivos procesados en {input_dir}.")
         return False
 
     print("--- Unificando Lotes ---")
     dfs = []
+    allowed_values_set = {str(value).strip() for value in (allowed_values or []) if str(value).strip()}
+
     for file_path in input_files:
         try:
             df = pd.read_excel(file_path)
-            
-            # Filter by 'Tipo' if the option is selected
-            if filter_by_tipo:
-                # Ensure 'Tipo' column exists
-                if 'Tipo' in df.columns:
-                    original_rows = len(df)
-                    df = df[df['Tipo'] == 'Materiales']
-                    print(f" [FILTRO] Lote '{os.path.basename(file_path)}': {len(df)} de {original_rows} filas son 'Materiales'.")
-                else:
-                    print(f" [ADVERTENCIA] La columna 'Tipo' no se encontró en '{os.path.basename(file_path)}', no se pudo filtrar.")
 
-            # Add 'Tipo_Obra' column based on filename (e.g., 'DD001')
+            if filter_column and allowed_values_set:
+                if filter_column in df.columns:
+                    original_rows = len(df)
+                    comparable_series = df[filter_column].astype(str).str.strip()
+                    df = df[comparable_series.isin(allowed_values_set)]
+                    print(
+                        f" [FILTRO] Lote '{os.path.basename(file_path)}': {len(df)} de "
+                        f"{original_rows} filas cumplen {filter_column} en {sorted(allowed_values_set)}."
+                    )
+                else:
+                    print(
+                        f" [ADVERTENCIA] La columna '{filter_column}' no se encontro "
+                        f"en '{os.path.basename(file_path)}', no se pudo filtrar."
+                    )
+
             batch_name = os.path.splitext(os.path.basename(file_path))[0]
             df.insert(0, "Tipo_Obra", batch_name)
-            
+
             dfs.append(df)
-            print(f" [OK] Leído lote: {batch_name} ({len(df)} filas)")
+            print(f" [OK] Leido lote: {batch_name} ({len(df)} filas)")
         except Exception as e:
-            print(f" [Error] Falló al leer {os.path.basename(file_path)}: {e}")
+            print(f" [Error] Fallo al leer {os.path.basename(file_path)}: {e}")
 
     if not dfs:
-        print("No se encontraron datos para consolidar (después de filtrar).")
+        print("No se encontraron datos para consolidar (despues de filtrar).")
         return False
 
-    # Consolidate
     df_consolidated = pd.concat(dfs, ignore_index=True)
+    df_consolidated = _safe_resolve_numeric_consistency(df_consolidated, context_label="consolidado")
+    df_consolidated = _apply_numeric_output_format(df_consolidated, output_numeric_format)
     print(f"\nTotal consolidado: {len(df_consolidated)} filas.")
 
     try:
-        # Save Final Output
         df_consolidated.to_excel(output_file_path, index=False)
-        print(f"\n[ÉXITO] Archivo final guardado en: {output_file_path}")
+        print(f"\n[EXITO] Archivo final guardado en: {output_file_path}")
         return True
     except Exception as e:
-        print(f"[ERROR] Falló al guardar el archivo consolidado: {e}")
+        print(f"[ERROR] Fallo al guardar el archivo consolidado: {e}")
         return False
+
 
 def _read_file_to_df(file_path):
     """Reads an Excel or CSV file into a pandas DataFrame."""
     if not file_path or not os.path.exists(file_path):
         return None
-    
+
     file_ext = os.path.splitext(file_path)[1].lower()
     try:
-        if file_ext in ['.xlsx', '.xls']:
+        if file_ext in [".xlsx", ".xls"]:
             return pd.read_excel(file_path)
-        elif file_ext == '.csv':
-            # Try common CSV formats
+        if file_ext == ".csv":
             try:
-                return pd.read_csv(file_path, sep=',')
+                return pd.read_csv(file_path, sep=",")
             except Exception:
-                return pd.read_csv(file_path, sep=';', encoding='latin1')
+                return pd.read_csv(file_path, sep=";", encoding="latin1")
     except Exception as e:
         print(f"Error al leer el archivo {os.path.basename(file_path)}: {e}")
         return None
+    return None
 
-def enrich_file(base_path, side_path, base_key, side_key, cols_to_add, output_path):
+
+def enrich_file(
+    base_path,
+    side_path,
+    base_key,
+    side_key,
+    cols_to_add,
+    cols_to_drop,
+    output_path,
+    output_numeric_format="excel",
+):
     """
     Enriches a base file with columns from a side file based on a key match.
     """
@@ -291,64 +530,80 @@ def enrich_file(base_path, side_path, base_key, side_key, cols_to_add, output_pa
             print("[ERROR] No se pudieron leer uno o ambos archivos.")
             return False
 
-        # --- Data Cleaning ---
         df_base.columns = [str(c).strip() for c in df_base.columns]
         df_side.columns = [str(c).strip() for c in df_side.columns]
-        
+        df_base = _safe_resolve_numeric_consistency(df_base, context_label="archivo base")
+        df_side = _safe_resolve_numeric_consistency(df_side, context_label="archivo enriquecimiento")
+
         base_key = base_key.strip()
         side_key = side_key.strip()
         cols_to_add = [c.strip() for c in cols_to_add]
+        cols_to_drop = [c.strip() for c in (cols_to_drop or [])]
 
-        # --- Validation ---
         if base_key not in df_base.columns:
-            print(f"[ERROR] La columna clave '{base_key}' no existe en el archivo base. Columnas disponibles: {list(df_base.columns)}")
+            print(
+                f"[ERROR] La columna clave '{base_key}' no existe en el archivo base. "
+                f"Columnas disponibles: {list(df_base.columns)}"
+            )
             return False
         if side_key not in df_side.columns:
-            print(f"[ERROR] La columna clave '{side_key}' no existe en el archivo de enriquecimiento. Columnas disponibles: {list(df_side.columns)}")
+            print(
+                f"[ERROR] La columna clave '{side_key}' no existe en el archivo de enriquecimiento. "
+                f"Columnas disponibles: {list(df_side.columns)}"
+            )
             return False
         for col in cols_to_add:
             if col not in df_side.columns:
-                print(f"[ERROR] La columna a agregar '{col}' no existe en el archivo de enriquecimiento. Columnas disponibles: {list(df_side.columns)}")
+                print(
+                    f"[ERROR] La columna a agregar '{col}' no existe en el archivo de "
+                    f"enriquecimiento. Columnas disponibles: {list(df_side.columns)}"
+                )
+                return False
+        for col in cols_to_drop:
+            if col not in df_base.columns:
+                print(
+                    f"[ERROR] La columna a quitar '{col}' no existe en el archivo base. "
+                    f"Columnas disponibles: {list(df_base.columns)}"
+                )
                 return False
 
-        # --- Merging ---
         print(f"Uniendo por '{base_key}' (base) y '{side_key}' (enriquecimiento)...")
-        
-        # Ensure keys are strings for reliable matching
+
         df_base[base_key] = df_base[base_key].astype(str).str.strip()
         df_side[side_key] = df_side[side_key].astype(str).str.strip()
-        
-        # Exclude the key column from the columns to be added
+
         if side_key in cols_to_add:
             cols_to_add.remove(side_key)
 
-        # Keep only necessary columns from side file
         df_side_subset = df_side[[side_key] + cols_to_add].drop_duplicates(subset=[side_key])
 
-        # Perform the merge
         df_enriched = pd.merge(
             df_base,
             df_side_subset,
             left_on=base_key,
             right_on=side_key,
-            how='left'
+            how="left",
         )
 
-        # Remove the side key column if it's different from the base key
         if base_key != side_key and side_key in df_enriched.columns:
             df_enriched.drop(columns=[side_key], inplace=True)
-        
-        # --- Reporting ---
+
+        removable_cols = [col for col in cols_to_drop if col in df_enriched.columns]
+        if removable_cols:
+            df_enriched.drop(columns=removable_cols, inplace=True)
+            print(f"Se quitaron {len(removable_cols)} columnas del resultado: {removable_cols}")
+
+        df_enriched = _apply_numeric_output_format(df_enriched, output_numeric_format)
+
         original_rows = len(df_base)
         matched_rows = df_enriched[cols_to_add[0]].notna().sum() if cols_to_add else 0
         print(f"Se encontraron coincidencias para {matched_rows} de {original_rows} filas.")
 
-        # --- Saving ---
         print(f"Guardando archivo enriquecido en: {output_path}")
         df_enriched.to_excel(output_path, index=False)
-        print("[ÉXITO] El archivo ha sido enriquecido y guardado.")
+        print("[EXITO] El archivo ha sido enriquecido y guardado.")
         return True
 
     except Exception as e:
-        print(f"[ERROR] Ocurrió un error inesperado durante el enriquecimiento: {e}")
+        print(f"[ERROR] Ocurrio un error inesperado durante el enriquecimiento: {e}")
         return False
