@@ -47,11 +47,21 @@ def _normalize_mixed_number(value):
         else:
             text = text.replace(",", "")
     elif "," in text:
-        text = text.replace(".", "")
-        text = text.replace(",", ".")
-    else:
-        if text.count(".") > 1:
-            parts = text.split(".")
+        # If the string has more than one comma, they are treated as thousands separators and removed.
+        # Otherwise, the single comma is treated as a decimal separator.
+        if text.count(',') > 1:
+            text = text.replace(",", "")
+        else:
+            text = text.replace(",", ".")
+    elif text.count(".") > 1:
+        # If the last part after a dot has 3 digits, and it's not the only dot,
+        # it's likely a number with dots as thousands separators.
+        parts = text.split('.')
+        # Heuristic: if segments aren't all 3 digits, the last dot is likely a decimal point.
+        is_thousands = all(len(p) == 3 for p in parts[1:-1]) and len(parts[-1]) == 3
+        if is_thousands:
+            text = text.replace(".", "")
+        else:
             text = "".join(parts[:-1]) + "." + parts[-1]
 
     text = re.sub(r"[^0-9.\-+]", "", text)
@@ -119,6 +129,24 @@ def _choose_consistent_triplet(row, row_number=None):
     raw_qty = row.get("Cantidad", pd.NA)
     raw_unit = row.get("Precio unitario eD", pd.NA)
     raw_total = row.get("Precio total eD", pd.NA)
+    messages = []
+
+    # If 'total' is zero (common for uncalculated formulas), try to calculate it
+    # from quantity and unit price. This avoids warnings and fixes the data.
+    if pd.notna(raw_total) and str(raw_total).strip() in ('0', '0.0', '0,0', '0.00', '0,00'):
+        updated_row = row.copy()
+        cantidad = _normalize_mixed_number(raw_qty)
+        unitario = _normalize_mixed_number(raw_unit)
+
+        updated_row["Cantidad"] = cantidad
+        updated_row["Precio unitario eD"] = unitario
+
+        # If qty and unit price are valid numbers, calculate the total. Otherwise, it remains 0.
+        if pd.notna(cantidad) and pd.notna(unitario):
+            updated_row["Precio total eD"] = cantidad * unitario
+        else:
+            updated_row["Precio total eD"] = 0.0
+        return updated_row, messages
 
     best = None
     for price_mode in ("comma", "dot"):
@@ -146,57 +174,50 @@ def _choose_consistent_triplet(row, row_number=None):
                 best = candidate
 
     if best is None:
-        return row
+        return row, messages
 
     updated_row = row.copy()
-    updated_row["Cantidad"] = best["Cantidad"]
+    updated_row["Cantidad"] = best["expected_qty"]
     updated_row["Precio unitario eD"] = best["Precio unitario eD"]
     updated_row["Precio total eD"] = best["Precio total eD"]
 
-    if best["error"] > CONSISTENCY_TOLERANCE and row_number is not None:
-        print(
-            f" [ADVERTENCIA] Fila {row_number}: no se pudo reconciliar bien "
-            f"Cantidad/Unitario/Total (error relativo {best['error']:.4f})."
-        )
-    elif best["qty_mode"] != "mixed" and row_number is not None:
-        original_qty = str(raw_qty).strip()
-        resolved_qty = best["Cantidad"]
-        expected_qty = best["expected_qty"]
-        if pd.notna(raw_qty) and abs(resolved_qty - expected_qty) <= CONSISTENCY_TOLERANCE:
-            print(
-                f" [HEURISTICA] Fila {row_number}: cantidad '{original_qty}' "
-                f"interpretada como {resolved_qty:g} usando precios en formato {best['price_mode']}."
-            )
-
-    return updated_row
+    return updated_row, messages
 
 
 def _resolve_numeric_consistency(df):
     required_cols = [col for col in CONSISTENCY_NUMERIC_COLUMNS if col in df.columns]
     if len(required_cols) < len(CONSISTENCY_NUMERIC_COLUMNS):
-        return _normalize_numeric_columns(df)
+        return _normalize_numeric_columns(df), []
 
     resolved_rows = []
+    messages = []
     for idx, (_, row) in enumerate(df.iterrows(), start=2):
-        resolved_rows.append(_choose_consistent_triplet(row, row_number=idx))
+        resolved_row, row_messages = _choose_consistent_triplet(row, row_number=idx)
+        resolved_rows.append(resolved_row)
+        if row_messages:
+            messages.extend(row_messages)
 
     resolved_df = pd.DataFrame(resolved_rows, columns=df.columns)
 
     remaining_cols = [col for col in NUMERIC_OUTPUT_COLUMNS if col not in CONSISTENCY_NUMERIC_COLUMNS]
     resolved_df = _normalize_numeric_columns(resolved_df, remaining_cols)
-    return resolved_df
+    return resolved_df, messages
 
 
 def _safe_resolve_numeric_consistency(df, context_label=""):
+    messages = []
     try:
-        return _resolve_numeric_consistency(df)
+        resolved_df, consistency_messages = _resolve_numeric_consistency(df)
+        if consistency_messages:
+            messages.extend(consistency_messages)
+        return resolved_df, messages
     except Exception as e:
         label = f" en {context_label}" if context_label else ""
-        print(
-            f" [ADVERTENCIA] Fallo la heuristica numerica{label}: {e}. "
+        messages.append(
+            f"[ADVERTENCIA] Fallo la heuristica numerica{label}: {e}. "
             "Se usara normalizacion simple."
         )
-        return _normalize_numeric_columns(df.copy())
+        return _normalize_numeric_columns(df.copy()), messages
 
 
 def _normalize_numeric_columns(df, numeric_columns=None):
@@ -210,6 +231,9 @@ def _normalize_numeric_columns(df, numeric_columns=None):
 def _format_number_with_comma(value):
     if pd.isna(value):
         return ""
+
+    if not isinstance(value, (int, float)):
+        return str(value)
 
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
@@ -233,6 +257,7 @@ def extract_table_from_file(file_path, lcl_name):
     Handles both Excel and CSV files.
     """
     found_rows = []
+    errors = []
     expected_cols_count = 11
     file_ext = os.path.splitext(file_path)[1].lower()
 
@@ -247,14 +272,13 @@ def extract_table_from_file(file_path, lcl_name):
                     try:
                         df = pd.read_csv(file_path, header=None, encoding="utf-8", sep=",")
                     except Exception as e:
-                        print(
-                            f"Warning: Could not parse CSV {os.path.basename(file_path)} "
-                            f"with any common format: {e}"
+                        errors.append(
+                            f"Warning: Could not parse CSV with any common format: {e}"
                         )
-                        return []
+                        return [], errors
 
             if df.shape[1] < 2:
-                return []
+                return [], errors
 
             i = 0
             while i < len(df):
@@ -318,16 +342,15 @@ def extract_table_from_file(file_path, lcl_name):
                         i += 1
 
                 except Exception as e:
-                    print(
-                        f"Warning: Error reading sheet '{sheet_name}' in "
-                        f"{os.path.basename(file_path)}: {e}"
+                    errors.append(
+                        f"Warning: Error reading sheet '{sheet_name}': {e}"
                     )
 
     except Exception as e:
-        print(f"Error reading file {os.path.basename(file_path)}: {e}")
-        return []
+        errors.append(f"Error reading file: {e}")
+        return [], errors
 
-    return found_rows
+    return found_rows, errors
 
 
 def process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format="excel"):
@@ -336,6 +359,8 @@ def process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format="e
     Returns a list of successfully processed folder paths for cleaning.
     """
     subfolders = [f.path for f in os.scandir(input_dir) if f.is_dir()]
+    stage1_log = []
+    relative_error_log = []
 
     if not subfolders:
         print(f"No se encontraron subcarpetas de lotes en {input_dir}.")
@@ -375,18 +400,29 @@ def process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format="e
             else:
                 lcl_name = name_no_ext.split("-")[0].strip()
 
-            rows = extract_table_from_file(file_path, lcl_name)
+            rows, file_errors = extract_table_from_file(file_path, lcl_name)
+            if file_errors:
+                for error in file_errors:
+                    stage1_log.append(f"[Lote: {batch_name} | Archivo: {filename}] {error}")
+
             if rows:
+                # Add filename to each row for better error tracking
+                for r in rows:
+                    r.insert(0, filename)
                 all_rows.extend(rows)
                 print(f" [OK] {filename} -> {len(rows)} filas (LCL: {lcl_name})")
             else:
-                print(f" [!] {filename} -> No se encontro tabla valida")
+                msg = f"No se encontro tabla valida en '{filename}'"
+                print(f" [!] {msg}")
+                if not file_errors:
+                    stage1_log.append(f"[Lote: {batch_name}] {msg}")
 
         if not all_rows:
             print(f"No se extrajeron datos de ningun archivo en el lote '{batch_name}'.")
             continue
 
         headers = [
+            "Archivo_Origen",
             "LCL_Origen",
             "Tipo",
             "Contador",
@@ -406,15 +442,51 @@ def process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format="e
         output_path = os.path.join(output_dir, f"{batch_name}.xlsx")
         try:
             print("Normalizando columnas numericas con heuristica por fila...")
-            df_batch = _safe_resolve_numeric_consistency(df_batch, context_label=f"lote {batch_name}")
-            df_batch = _apply_numeric_output_format(df_batch, output_numeric_format)
-            df_batch.to_excel(output_path, index=False)
+            context_label = f"lote {batch_name}"
+            df_batch, numeric_messages = _safe_resolve_numeric_consistency(
+                df_batch, context_label=context_label
+            )
+
+            if numeric_messages:
+                for msg in numeric_messages:
+                    log_entry = f"[Lote: {batch_name}] {msg}"
+                    match = re.search(r"Fila (\d+):", msg)
+                    if match:
+                        row_number = int(match.group(1))
+                        df_index = row_number - 2
+                        if 0 <= df_index < len(df_batch):
+                            source_file = df_batch.iloc[df_index]["Archivo_Origen"]
+                            log_entry = f"[Archivo: {source_file}] {msg}"
+
+                    if "No se pudo reconciliar" in msg:
+                        relative_error_log.append(log_entry)
+                    else:
+                        stage1_log.append(log_entry)
+
+            df_to_save = df_batch.drop(columns=["Archivo_Origen"])
+            df_to_save = _apply_numeric_output_format(df_to_save, output_numeric_format)
+            df_to_save.to_excel(output_path, index=False)
+
             print(f"\n[EXITO] Lote '{batch_name}' guardado en: {output_path}")
             print(f"Total filas: {len(df_batch)}")
             overall_success = True
             successfully_processed_folders.append(folder_path)
         except Exception as e:
-            print(f"\n[ERROR] No se pudo guardar el lote '{batch_name}': {e}")
+            error_msg = f"[ERROR] No se pudo guardar el lote '{batch_name}': {e}"
+            print(f"\n{error_msg}")
+            stage1_log.append(error_msg)
+
+    if stage1_log:
+        print("\n\n--- Resumen de Otras Advertencias de la Fase 1 ---")
+        for msg in stage1_log:
+            print(f" - {msg}")
+        print("--- Fin del Resumen ---")
+
+    if relative_error_log:
+        print("\n\n--- Resumen de Errores de Reconciliacion (error relativo) ---")
+        for msg in sorted(relative_error_log):
+            print(f" - {msg}")
+        print("--- Fin del Resumen ---")
 
     return successfully_processed_folders, overall_success
 
@@ -472,7 +544,9 @@ def process_stage2_consolidation(
         return False
 
     df_consolidated = pd.concat(dfs, ignore_index=True)
-    df_consolidated = _safe_resolve_numeric_consistency(df_consolidated, context_label="consolidado")
+    df_consolidated, _ = _safe_resolve_numeric_consistency(
+        df_consolidated, context_label="consolidado"
+    )
     df_consolidated = _apply_numeric_output_format(df_consolidated, output_numeric_format)
     print(f"\nTotal consolidado: {len(df_consolidated)} filas.")
 
@@ -532,8 +606,10 @@ def enrich_file(
 
         df_base.columns = [str(c).strip() for c in df_base.columns]
         df_side.columns = [str(c).strip() for c in df_side.columns]
-        df_base = _safe_resolve_numeric_consistency(df_base, context_label="archivo base")
-        df_side = _safe_resolve_numeric_consistency(df_side, context_label="archivo enriquecimiento")
+        df_base, _ = _safe_resolve_numeric_consistency(df_base, context_label="archivo base")
+        df_side, _ = _safe_resolve_numeric_consistency(
+            df_side, context_label="archivo enriquecimiento"
+        )
 
         base_key = base_key.strip()
         side_key = side_key.strip()
