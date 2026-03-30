@@ -353,124 +353,147 @@ def extract_table_from_file(file_path, lcl_name):
     return found_rows, errors
 
 
+def _build_batch_dataframe(batch_name, folder_path):
+    stage1_log = []
+    relative_error_log = []
+
+    input_files = (
+        glob.glob(os.path.join(folder_path, "*.xlsx"))
+        + glob.glob(os.path.join(folder_path, "*.xls"))
+        + glob.glob(os.path.join(folder_path, "*.csv"))
+    )
+
+    if not input_files:
+        print(f" [!] No se encontraron archivos Excel o CSV en la carpeta '{batch_name}'.")
+        return None, stage1_log, relative_error_log
+
+    print(f"Procesando {len(input_files)} archivos para el lote '{batch_name}'...")
+
+    all_rows = []
+    for file_path in input_files:
+        filename = os.path.basename(file_path)
+        name_no_ext = os.path.splitext(filename)[0]
+
+        if "lcl" in name_no_ext.lower():
+            numbers = re.findall(r"\d+", name_no_ext)
+            if numbers:
+                lcl_name = max(numbers, key=len)
+            else:
+                lcl_name = name_no_ext.split("-")[0].strip()
+        else:
+            lcl_name = name_no_ext.split("-")[0].strip()
+
+        rows, file_errors = extract_table_from_file(file_path, lcl_name)
+        if file_errors:
+            for error in file_errors:
+                stage1_log.append(f"[Lote: {batch_name} | Archivo: {filename}] {error}")
+
+        if rows:
+            for r in rows:
+                r.insert(0, filename)
+            all_rows.extend(rows)
+            print(f" [OK] {filename} -> {len(rows)} filas (LCL: {lcl_name})")
+        else:
+            msg = f"No se encontro tabla valida en '{filename}'"
+            print(f" [!] {msg}")
+            if not file_errors:
+                stage1_log.append(f"[Lote: {batch_name}] {msg}")
+
+    if not all_rows:
+        print(f"No se extrajeron datos de ningun archivo en el lote '{batch_name}'.")
+        return None, stage1_log, relative_error_log
+
+    headers = [
+        "Archivo_Origen",
+        "LCL_Origen",
+        "Tipo",
+        "Contador",
+        "Mat./Prest.",
+        "Descripcion Mat./Serv.",
+        "Cantidad",
+        "Unidad medida base",
+        "Imputacion",
+        "Precio unitario eD",
+        "Precio unitario cliente",
+        "Precio total eD",
+        "Precio total cliente",
+    ]
+
+    df_batch = pd.DataFrame(all_rows, columns=headers)
+
+    print("Normalizando columnas numericas con heuristica por fila...")
+    context_label = f"lote {batch_name}"
+    df_batch, numeric_messages = _safe_resolve_numeric_consistency(
+        df_batch, context_label=context_label
+    )
+
+    if numeric_messages:
+        for msg in numeric_messages:
+            log_entry = f"[Lote: {batch_name}] {msg}"
+            match = re.search(r"Fila (\d+):", msg)
+            if match:
+                row_number = int(match.group(1))
+                df_index = row_number - 2
+                if 0 <= df_index < len(df_batch):
+                    source_file = df_batch.iloc[df_index]["Archivo_Origen"]
+                    log_entry = f"[Archivo: {source_file}] {msg}"
+
+            if "No se pudo reconciliar" in msg:
+                relative_error_log.append(log_entry)
+            else:
+                stage1_log.append(log_entry)
+
+    return df_batch, stage1_log, relative_error_log
+
+
+def _collect_batches_from_subfolders(input_dir):
+    subfolders = [f.path for f in os.scandir(input_dir) if f.is_dir()]
+    stage1_log = []
+    relative_error_log = []
+    batch_dfs = []
+    processed_folders = []
+
+    if not subfolders:
+        print(f"No se encontraron subcarpetas de lotes en {input_dir}.")
+        return batch_dfs, processed_folders, stage1_log, relative_error_log, False
+
+    print(f"Se encontraron {len(subfolders)} subcarpetas para procesar.")
+
+    for folder_path in subfolders:
+        batch_name = os.path.basename(folder_path)
+        print(f"\n--- Procesando Lote: {batch_name} ---")
+        df_batch, batch_log, batch_relative_log = _build_batch_dataframe(batch_name, folder_path)
+        stage1_log.extend(batch_log)
+        relative_error_log.extend(batch_relative_log)
+
+        if df_batch is None:
+            continue
+
+        batch_dfs.append((batch_name, df_batch))
+        processed_folders.append(folder_path)
+
+    overall_success = bool(batch_dfs)
+    return batch_dfs, processed_folders, stage1_log, relative_error_log, overall_success
+
+
 def process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format="excel"):
     """
     Stage 1: Find subfolders in input_dir and process each as a batch.
     Returns a list of successfully processed folder paths for cleaning.
     """
-    subfolders = [f.path for f in os.scandir(input_dir) if f.is_dir()]
-    stage1_log = []
-    relative_error_log = []
+    batch_dfs, successfully_processed_folders, stage1_log, relative_error_log, overall_success = _collect_batches_from_subfolders(
+        input_dir
+    )
 
-    if not subfolders:
-        print(f"No se encontraron subcarpetas de lotes en {input_dir}.")
-        return [], False
-
-    print(f"Se encontraron {len(subfolders)} subcarpetas para procesar.")
-    overall_success = False
-    successfully_processed_folders = []
-
-    for folder_path in subfolders:
-        batch_name = os.path.basename(folder_path)
-        print(f"\n--- Procesando Lote: {batch_name} ---")
-
-        input_files = (
-            glob.glob(os.path.join(folder_path, "*.xlsx"))
-            + glob.glob(os.path.join(folder_path, "*.xls"))
-            + glob.glob(os.path.join(folder_path, "*.csv"))
-        )
-
-        if not input_files:
-            print(f" [!] No se encontraron archivos Excel o CSV en la carpeta '{batch_name}'.")
-            continue
-
-        print(f"Procesando {len(input_files)} archivos para el lote '{batch_name}'...")
-
-        all_rows = []
-        for file_path in input_files:
-            filename = os.path.basename(file_path)
-            name_no_ext = os.path.splitext(filename)[0]
-
-            if "lcl" in name_no_ext.lower():
-                numbers = re.findall(r"\d+", name_no_ext)
-                if numbers:
-                    lcl_name = max(numbers, key=len)
-                else:
-                    lcl_name = name_no_ext.split("-")[0].strip()
-            else:
-                lcl_name = name_no_ext.split("-")[0].strip()
-
-            rows, file_errors = extract_table_from_file(file_path, lcl_name)
-            if file_errors:
-                for error in file_errors:
-                    stage1_log.append(f"[Lote: {batch_name} | Archivo: {filename}] {error}")
-
-            if rows:
-                # Add filename to each row for better error tracking
-                for r in rows:
-                    r.insert(0, filename)
-                all_rows.extend(rows)
-                print(f" [OK] {filename} -> {len(rows)} filas (LCL: {lcl_name})")
-            else:
-                msg = f"No se encontro tabla valida en '{filename}'"
-                print(f" [!] {msg}")
-                if not file_errors:
-                    stage1_log.append(f"[Lote: {batch_name}] {msg}")
-
-        if not all_rows:
-            print(f"No se extrajeron datos de ningun archivo en el lote '{batch_name}'.")
-            continue
-
-        headers = [
-            "Archivo_Origen",
-            "LCL_Origen",
-            "Tipo",
-            "Contador",
-            "Mat./Prest.",
-            "Descripcion Mat./Serv.",
-            "Cantidad",
-            "Unidad medida base",
-            "Imputacion",
-            "Precio unitario eD",
-            "Precio unitario cliente",
-            "Precio total eD",
-            "Precio total cliente",
-        ]
-
-        df_batch = pd.DataFrame(all_rows, columns=headers)
-
+    for batch_name, df_batch in batch_dfs:
         output_path = os.path.join(output_dir, f"{batch_name}.xlsx")
         try:
-            print("Normalizando columnas numericas con heuristica por fila...")
-            context_label = f"lote {batch_name}"
-            df_batch, numeric_messages = _safe_resolve_numeric_consistency(
-                df_batch, context_label=context_label
-            )
-
-            if numeric_messages:
-                for msg in numeric_messages:
-                    log_entry = f"[Lote: {batch_name}] {msg}"
-                    match = re.search(r"Fila (\d+):", msg)
-                    if match:
-                        row_number = int(match.group(1))
-                        df_index = row_number - 2
-                        if 0 <= df_index < len(df_batch):
-                            source_file = df_batch.iloc[df_index]["Archivo_Origen"]
-                            log_entry = f"[Archivo: {source_file}] {msg}"
-
-                    if "No se pudo reconciliar" in msg:
-                        relative_error_log.append(log_entry)
-                    else:
-                        stage1_log.append(log_entry)
-
             df_to_save = df_batch.drop(columns=["Archivo_Origen"])
             df_to_save = _apply_numeric_output_format(df_to_save, output_numeric_format)
             df_to_save.to_excel(output_path, index=False)
 
             print(f"\n[EXITO] Lote '{batch_name}' guardado en: {output_path}")
             print(f"Total filas: {len(df_batch)}")
-            overall_success = True
-            successfully_processed_folders.append(folder_path)
         except Exception as e:
             error_msg = f"[ERROR] No se pudo guardar el lote '{batch_name}': {e}"
             print(f"\n{error_msg}")
@@ -559,6 +582,39 @@ def process_stage2_consolidation(
         return False
 
 
+def _apply_consolidation_filter(df, filter_column=None, allowed_values=None, context_label="consolidado"):
+    allowed_values_set = {str(value).strip() for value in (allowed_values or []) if str(value).strip()}
+    if not filter_column or not allowed_values_set:
+        return df
+
+    if filter_column not in df.columns:
+        print(
+            f" [ADVERTENCIA] La columna '{filter_column}' no se encontro en {context_label}, no se pudo filtrar."
+        )
+        return df
+
+    original_rows = len(df)
+    comparable_series = df[filter_column].astype(str).str.strip()
+    filtered_df = df[comparable_series.isin(allowed_values_set)]
+    print(
+        f" [FILTRO] {context_label}: {len(filtered_df)} de {original_rows} filas cumplen "
+        f"{filter_column} en {sorted(allowed_values_set)}."
+    )
+    return filtered_df
+
+
+def _normalize_key_series(series, column_name=""):
+    normalized = series.astype(str).str.strip()
+
+    if "lcl" not in str(column_name).lower():
+        return normalized
+
+    extracted_digits = normalized.str.findall(r"\d+").apply(
+        lambda matches: max(matches, key=len) if matches else ""
+    )
+    return extracted_digits.where(extracted_digits != "", normalized)
+
+
 def _read_file_to_df(file_path):
     """Reads an Excel or CSV file into a pandas DataFrame."""
     if not file_path or not os.path.exists(file_path):
@@ -604,75 +660,21 @@ def enrich_file(
             print("[ERROR] No se pudieron leer uno o ambos archivos.")
             return False
 
-        df_base.columns = [str(c).strip() for c in df_base.columns]
-        df_side.columns = [str(c).strip() for c in df_side.columns]
-        df_base, _ = _safe_resolve_numeric_consistency(df_base, context_label="archivo base")
-        df_side, _ = _safe_resolve_numeric_consistency(
-            df_side, context_label="archivo enriquecimiento"
-        )
-
-        base_key = base_key.strip()
-        side_key = side_key.strip()
-        cols_to_add = [c.strip() for c in cols_to_add]
-        cols_to_drop = [c.strip() for c in (cols_to_drop or [])]
-
-        if base_key not in df_base.columns:
-            print(
-                f"[ERROR] La columna clave '{base_key}' no existe en el archivo base. "
-                f"Columnas disponibles: {list(df_base.columns)}"
-            )
-            return False
-        if side_key not in df_side.columns:
-            print(
-                f"[ERROR] La columna clave '{side_key}' no existe en el archivo de enriquecimiento. "
-                f"Columnas disponibles: {list(df_side.columns)}"
-            )
-            return False
-        for col in cols_to_add:
-            if col not in df_side.columns:
-                print(
-                    f"[ERROR] La columna a agregar '{col}' no existe en el archivo de "
-                    f"enriquecimiento. Columnas disponibles: {list(df_side.columns)}"
-                )
-                return False
-        for col in cols_to_drop:
-            if col not in df_base.columns:
-                print(
-                    f"[ERROR] La columna a quitar '{col}' no existe en el archivo base. "
-                    f"Columnas disponibles: {list(df_base.columns)}"
-                )
-                return False
-
-        print(f"Uniendo por '{base_key}' (base) y '{side_key}' (enriquecimiento)...")
-
-        df_base[base_key] = df_base[base_key].astype(str).str.strip()
-        df_side[side_key] = df_side[side_key].astype(str).str.strip()
-
-        if side_key in cols_to_add:
-            cols_to_add.remove(side_key)
-
-        df_side_subset = df_side[[side_key] + cols_to_add].drop_duplicates(subset=[side_key])
-
-        df_enriched = pd.merge(
+        df_enriched = enrich_dataframe(
             df_base,
-            df_side_subset,
-            left_on=base_key,
-            right_on=side_key,
-            how="left",
+            df_side,
+            base_key,
+            side_key,
+            cols_to_add,
+            cols_to_drop,
         )
-
-        if base_key != side_key and side_key in df_enriched.columns:
-            df_enriched.drop(columns=[side_key], inplace=True)
-
-        removable_cols = [col for col in cols_to_drop if col in df_enriched.columns]
-        if removable_cols:
-            df_enriched.drop(columns=removable_cols, inplace=True)
-            print(f"Se quitaron {len(removable_cols)} columnas del resultado: {removable_cols}")
+        if df_enriched is None:
+            return False
 
         df_enriched = _apply_numeric_output_format(df_enriched, output_numeric_format)
-
         original_rows = len(df_base)
-        matched_rows = df_enriched[cols_to_add[0]].notna().sum() if cols_to_add else 0
+        visible_cols_to_add = [c.strip() for c in cols_to_add if c.strip() != side_key.strip()]
+        matched_rows = df_enriched[visible_cols_to_add[0]].notna().sum() if visible_cols_to_add else 0
         print(f"Se encontraron coincidencias para {matched_rows} de {original_rows} filas.")
 
         print(f"Guardando archivo enriquecido en: {output_path}")
@@ -682,4 +684,165 @@ def enrich_file(
 
     except Exception as e:
         print(f"[ERROR] Ocurrio un error inesperado durante el enriquecimiento: {e}")
+        return False
+
+
+def enrich_dataframe(df_base, df_side, base_key, side_key, cols_to_add, cols_to_drop=None):
+    df_base = df_base.copy()
+    df_side = df_side.copy()
+
+    df_base.columns = [str(c).strip() for c in df_base.columns]
+    df_side.columns = [str(c).strip() for c in df_side.columns]
+    df_base, _ = _safe_resolve_numeric_consistency(df_base, context_label="archivo base")
+    df_side, _ = _safe_resolve_numeric_consistency(
+        df_side, context_label="archivo enriquecimiento"
+    )
+
+    base_key = base_key.strip()
+    side_key = side_key.strip()
+    cols_to_add = [c.strip() for c in cols_to_add]
+    cols_to_drop = [c.strip() for c in (cols_to_drop or [])]
+
+    if base_key not in df_base.columns:
+        print(
+            f"[ERROR] La columna clave '{base_key}' no existe en el archivo base. "
+            f"Columnas disponibles: {list(df_base.columns)}"
+        )
+        return None
+    if side_key not in df_side.columns:
+        print(
+            f"[ERROR] La columna clave '{side_key}' no existe en el archivo de enriquecimiento. "
+            f"Columnas disponibles: {list(df_side.columns)}"
+        )
+        return None
+    for col in cols_to_add:
+        if col not in df_side.columns:
+            print(
+                f"[ERROR] La columna a agregar '{col}' no existe en el archivo de "
+                f"enriquecimiento. Columnas disponibles: {list(df_side.columns)}"
+            )
+            return None
+    for col in cols_to_drop:
+        if col not in df_base.columns:
+            print(
+                f"[ERROR] La columna a quitar '{col}' no existe en el archivo base. "
+                f"Columnas disponibles: {list(df_base.columns)}"
+            )
+            return None
+
+    print(f"Uniendo por '{base_key}' (base) y '{side_key}' (enriquecimiento)...")
+
+    df_base[base_key] = _normalize_key_series(df_base[base_key], base_key)
+    df_side[side_key] = _normalize_key_series(df_side[side_key], side_key)
+
+    visible_cols_to_add = [col for col in cols_to_add if col != side_key]
+    df_side_subset = df_side[[side_key] + visible_cols_to_add].drop_duplicates(subset=[side_key])
+
+    df_enriched = pd.merge(
+        df_base,
+        df_side_subset,
+        left_on=base_key,
+        right_on=side_key,
+        how="left",
+    )
+
+    if base_key != side_key and side_key in df_enriched.columns:
+        df_enriched.drop(columns=[side_key], inplace=True)
+
+    removable_cols = [col for col in cols_to_drop if col in df_enriched.columns]
+    if removable_cols:
+        df_enriched.drop(columns=removable_cols, inplace=True)
+        print(f"Se quitaron {len(removable_cols)} columnas del resultado: {removable_cols}")
+
+    return df_enriched
+
+
+def run_unified_process(
+    input_dir,
+    output_file_path,
+    output_numeric_format="excel",
+    filter_column=None,
+    allowed_values=None,
+    enrich_config=None,
+    save_batches_dir=None,
+):
+    batch_dfs, _, stage1_log, relative_error_log, overall_success = _collect_batches_from_subfolders(
+        input_dir
+    )
+
+    if not overall_success:
+        return False
+
+    consolidated_parts = []
+    for batch_name, df_batch in batch_dfs:
+        df_work = df_batch.drop(columns=["Archivo_Origen"]).copy()
+        df_work.insert(0, "Tipo_Obra", batch_name)
+        consolidated_parts.append(df_work)
+
+        if save_batches_dir:
+            output_path = os.path.join(save_batches_dir, f"{batch_name}.xlsx")
+            try:
+                batch_to_save = _apply_numeric_output_format(df_work.copy(), output_numeric_format)
+                batch_to_save.to_excel(output_path, index=False)
+                print(f"[EXITO] Lote intermedio guardado en: {output_path}")
+            except Exception as e:
+                print(f"[ERROR] No se pudo guardar el lote intermedio '{batch_name}': {e}")
+
+    if stage1_log:
+        print("\n\n--- Resumen de Otras Advertencias de la Fase 1 ---")
+        for msg in stage1_log:
+            print(f" - {msg}")
+        print("--- Fin del Resumen ---")
+
+    if relative_error_log:
+        print("\n\n--- Resumen de Errores de Reconciliacion (error relativo) ---")
+        for msg in sorted(relative_error_log):
+            print(f" - {msg}")
+        print("--- Fin del Resumen ---")
+
+    df_consolidated = pd.concat(consolidated_parts, ignore_index=True)
+    df_consolidated = _apply_consolidation_filter(
+        df_consolidated,
+        filter_column=filter_column,
+        allowed_values=allowed_values,
+        context_label="proceso unificado",
+    )
+    df_consolidated, _ = _safe_resolve_numeric_consistency(
+        df_consolidated, context_label="consolidado"
+    )
+
+    if enrich_config and enrich_config.get("enabled"):
+        side_path = enrich_config.get("side_path", "")
+        side_key = enrich_config.get("side_key", "")
+        base_key = enrich_config.get("base_key", "")
+        cols_to_add = enrich_config.get("cols_to_add", [])
+        cols_to_drop = enrich_config.get("cols_to_drop", [])
+
+        print("\n--- Aplicando enriquecimiento dentro del proceso unificado ---")
+        df_side = _read_file_to_df(side_path)
+        if df_side is None:
+            print("[ERROR] No se pudo leer el archivo de enriquecimiento.")
+            return False
+
+        df_enriched = enrich_dataframe(
+            df_consolidated,
+            df_side,
+            base_key,
+            side_key,
+            cols_to_add,
+            cols_to_drop,
+        )
+        if df_enriched is None:
+            return False
+        df_consolidated = df_enriched
+
+    df_consolidated = _apply_numeric_output_format(df_consolidated, output_numeric_format)
+    print(f"\nTotal consolidado final: {len(df_consolidated)} filas.")
+
+    try:
+        df_consolidated.to_excel(output_file_path, index=False)
+        print(f"\n[EXITO] Archivo final guardado en: {output_file_path}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Fallo al guardar el archivo unificado final: {e}")
         return False
