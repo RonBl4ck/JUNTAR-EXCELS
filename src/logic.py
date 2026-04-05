@@ -91,9 +91,14 @@ def _parse_number_variant(value, decimal_mode):
         return pd.NA
 
     if decimal_mode == "comma":
+        # Check if comma is followed by exactly 3 digits (thousands separator?)
+        # or if it's clearly a decimal (e.g. 2 digits). 
+        # Standard reports use dot for thousands and comma for decimal or vice versa.
         text = text.replace(".", "")
         text = text.replace(",", ".")
     elif decimal_mode == "dot":
+        # In dot mode, we assume comma is a thousands separator.
+        # But if it's just one comma and it's near the end, it's risky.
         text = text.replace(",", "")
     else:
         return pd.NA
@@ -170,16 +175,35 @@ def _choose_consistent_triplet(row, row_number=None):
                 "error": error,
                 "expected_qty": expected_qty,
             }
-            if best is None or candidate["error"] < best["error"]:
+            # HEURISTIC FIX: If errors are nearly identical (e.g. 1.23 vs 123),
+            # prefer the interpretation that yields SMALLER values (avoiding x100/x1000 inflation).
+            if best is None:
                 best = candidate
+            else:
+                diff_error = candidate["error"] - best["error"]
+                if diff_error < -1e-13:
+                    # Found a significantly better match
+                    best = candidate
+                elif abs(diff_error) <= 1e-13:
+                    # Ties in relative error (Ambiguity)
+                    # Prefer the mode that resulted in a smaller absolute total price
+                    if abs(candidate["Precio total eD"]) < abs(best["Precio total eD"]):
+                        best = candidate
 
     if best is None:
         return row, messages
 
     updated_row = row.copy()
-    updated_row["Cantidad"] = best["expected_qty"]
-    updated_row["Precio unitario eD"] = best["Precio unitario eD"]
-    updated_row["Precio total eD"] = best["Precio total eD"]
+    
+    # ROUNDING FIX: Use round(n, 4) to avoid 15.5999999997 issues
+    # and prefer the consistent triplet but with a sensible precision.
+    val_qty = round(float(best["expected_qty"]), 4)
+    val_unit = round(float(best["Precio unitario eD"]), 4)
+    val_total = round(float(best["Precio total eD"]), 4)
+
+    updated_row["Cantidad"] = val_qty
+    updated_row["Precio unitario eD"] = val_unit
+    updated_row["Precio total eD"] = val_total
 
     return updated_row, messages
 

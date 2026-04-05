@@ -35,10 +35,13 @@ ctk.set_default_color_theme("blue")
 class ConsoleRedirector:
     """Redirect stdout/stderr to a text widget."""
 
-    def __init__(self, text_widget):
+    def __init__(self, text_widget, on_write_callback=None):
         self.text_widget = text_widget
+        self.on_write_callback = on_write_callback
 
     def write(self, string):
+        if self.on_write_callback:
+            self.on_write_callback(string)
         self.text_widget.after(0, self._write, string)
 
     def _write(self, string):
@@ -58,8 +61,19 @@ class App:
         self.root.geometry("1280x860")
         self.root.minsize(1100, 760)
         self.root.configure(fg_color=CORPORATE_COLORS["bg"])
-        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
+
+        self.console_is_expanded = True
+        self.files_processed_count = 0
+        self.files_error_count = 0
+        self.files_error_list = []
+        
+        # Registry for widget synchronization across pages
+        self.all_combos_base_key = []
+        self.all_combos_side_key = []
+        self.all_listboxes_add = []
+        self.all_listboxes_selected = []
 
         self.enrich_base_file = tk.StringVar()
         self.enrich_side_file = tk.StringVar()
@@ -87,25 +101,226 @@ class App:
         self._build_shell()
         self._sync_unified_base_headers()
 
-        sys.stdout = ConsoleRedirector(self.console_text)
-        sys.stderr = ConsoleRedirector(self.console_text)
+        sys.stdout = ConsoleRedirector(self.console_text, self._on_console_write)
+        sys.stderr = ConsoleRedirector(self.console_text, self._on_console_write)
 
         print("Sistema listo. Esperando instrucciones...")
 
     def _build_shell(self):
+        # Sidebar
+        self.sidebar = ctk.CTkFrame(
+            self.root,
+            width=200,
+            corner_radius=0,
+            fg_color=CORPORATE_COLORS["navy"],
+        )
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_rowconfigure(10, weight=1)
+
+        self._build_sidebar_content()
+
+        # Content Area
         self.content = ctk.CTkFrame(
             self.root,
             fg_color=CORPORATE_COLORS["bg"],
             corner_radius=0,
         )
-        self.content.grid(row=0, column=0, sticky="nsew")
+        self.content.grid(row=0, column=1, sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
-        self.content.grid_rowconfigure(1, weight=1)
-        self.content.grid_rowconfigure(2, weight=0)
+        self.content.grid_rowconfigure(1, weight=1) # Page container
+        self.content.grid_rowconfigure(2, weight=0) # Console (initially hidden or small)
 
         self._build_header()
-        self._build_tabs()
+        
+        # Page Container
+        self.pages_container = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.pages_container.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 10))
+        self.pages_container.grid_columnconfigure(0, weight=1)
+        self.pages_container.grid_rowconfigure(0, weight=1)
+
+        self.pages = {}
+        self._create_pages()
+        
         self._build_console()
+        
+        # Start with Dashboard or Unified
+        self._show_page("unificado")
+
+    def _build_sidebar_content(self):
+        ctk.CTkLabel(
+            self.sidebar,
+            text="MENU",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="white",
+        ).grid(row=0, column=0, padx=20, pady=(30, 20))
+
+        self.nav_buttons = {}
+        btn_config = [
+            ("Unificacion Pro", "unificado"),
+            ("Cruce Express", "cruce"),
+            # ("Historial", "historial"),
+        ]
+
+        for i, (label, page_id) in enumerate(btn_config, start=1):
+            btn = ctk.CTkButton(
+                self.sidebar,
+                text=label,
+                command=lambda p=page_id: self._show_page(p),
+                fg_color="transparent",
+                text_color="#D7E5F2",
+                hover_color=CORPORATE_COLORS["blue"],
+                anchor="w",
+                height=40,
+                corner_radius=8,
+            )
+            btn.grid(row=i, column=0, sticky="ew", padx=10, pady=4)
+            self.nav_buttons[page_id] = btn
+
+    def _create_pages(self):
+        # 1. Unificado
+        unificado_page = ctk.CTkFrame(self.pages_container, fg_color="transparent")
+        self.pages["unificado"] = unificado_page
+        self._create_main_process_tab(unificado_page)
+
+        # 2. Cruce Solo
+        cruce_page = ctk.CTkFrame(self.pages_container, fg_color="transparent")
+        self.pages["cruce"] = cruce_page
+        self._create_solo_enrich_page(cruce_page)
+
+    def _show_page(self, page_id):
+        for page in self.pages.values():
+            page.grid_forget()
+        
+        self.pages[page_id].grid(row=0, column=0, sticky="nsew")
+        
+        # Update button styles
+        for pid, btn in self.nav_buttons.items():
+            if pid == page_id:
+                btn.configure(fg_color=CORPORATE_COLORS["blue"], text_color="white")
+            else:
+                btn.configure(fg_color="transparent", text_color="#D7E5F2")
+
+    def _create_solo_enrich_page(self, parent):
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Base File
+        base_card = self._create_section_card(scroll, "1 - Archivo Base")
+        self._file_picker_row(
+            base_card,
+            "Seleccionar archivo a enriquecer",
+            self.enrich_base_file,
+            self._select_base_file,
+            "Seleccionar base",
+        )
+
+        # Side File (duplicated logic for express mode)
+        side_card = self._create_section_card(scroll, "2 - Archivo de Enriquecimiento")
+        self._file_picker_row(
+            side_card,
+            "Archivo con los datos nuevos",
+            self.enrich_side_file,
+            self._select_enrich_file,
+            "Seleccionar datos",
+        )
+
+        # We reuse the existing details structure but inside this page
+        # To make it simple for now, we'll just show the same configuration widgets
+        # but configured for this specific flow.
+        
+        config_card = self._create_section_card(scroll, "3 - Cruce de Columnas")
+        
+        # Key configuration
+        keys_inner = ctk.CTkFrame(config_card, fg_color=CORPORATE_COLORS["surface_alt"], corner_radius=14)
+        keys_inner.pack(fill="x", padx=20, pady=(0, 10))
+        
+        combo_base = self._create_labeled_combo(keys_inner, "Columna Clave (Base)", self.enrich_base_key_col)
+        self.all_combos_base_key.append(combo_base)
+        
+        combo_side = self._create_labeled_combo(keys_inner, "Columna Clave (Enriquecimiento)", self.enrich_side_key_col)
+        self.all_combos_side_key.append(combo_side)
+        
+        self._create_column_manager_section(scroll)
+
+        run_card = self._create_section_card(scroll, "4 - Resultado")
+        self._create_output_format_selector(run_card, compact=True)
+        ctk.CTkButton(
+            run_card,
+            text="Ejecutar Cruce Solamente",
+            command=self._run_enrich_process,
+            fg_color=CORPORATE_COLORS["green"],
+            hover_color="#27AE60",
+            height=48,
+            corner_radius=14,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(fill="x", padx=20, pady=(0, 20))
+
+    def _create_column_manager_section(self, parent):
+        card = self._create_section_card(parent, "3 - Columnas para Enriquecer")
+        
+        # Search row
+        search_row = ctk.CTkFrame(card, fg_color="transparent")
+        search_row.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(search_row, text="🔎 Buscar:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 5))
+        search_entry = ctk.CTkEntry(
+            search_row, 
+            textvariable=self.enrich_col_search_var, 
+            placeholder_text="Filtrar por nombre...",
+            height=28,
+            border_width=1
+        )
+        search_entry.pack(side="left", fill="x", expand=True)
+        search_entry.bind("<KeyRelease>", self._filter_cols_listbox)
+
+        # Lists Container
+        lists_frame = ctk.CTkFrame(card, fg_color="transparent")
+        lists_frame.pack(fill="both", expand=True, padx=16, pady=(10, 15))
+        lists_frame.grid_columnconfigure((0, 2), weight=1)
+        
+        # Available
+        ctk.CTkLabel(lists_frame, text="DISPONIBLES", font=ctk.CTkFont(size=10, weight="bold"), text_color=CORPORATE_COLORS["muted"]).grid(row=0, column=0, sticky="w", padx=2)
+        lb_add = self._create_listbox(lists_frame, height=7)
+        lb_add.grid(row=1, column=0, sticky="nsew", pady=2)
+        self.all_listboxes_add.append(lb_add)
+
+        # Selected
+        ctk.CTkLabel(lists_frame, text="SELECCIONADAS", font=ctk.CTkFont(size=10, weight="bold"), text_color=CORPORATE_COLORS["muted"]).grid(row=0, column=2, sticky="w", padx=2)
+        lb_sel = self._create_listbox(lists_frame, height=7)
+        lb_sel.grid(row=1, column=2, sticky="nsew", pady=2)
+        self.all_listboxes_selected.append(lb_sel)
+        
+        # Transfer Buttons (Center)
+        btns = ctk.CTkFrame(lists_frame, fg_color="transparent")
+        btns.grid(row=1, column=1, padx=10, sticky="ns")
+        
+        ctk.CTkButton(
+            btns, 
+            text="Add >>", 
+            command=self._add_selected_enrich_columns, 
+            width=60, 
+            height=32,
+            fg_color=CORPORATE_COLORS["green"],
+            hover_color="#27AE60",
+            font=("Segoe UI Semibold", 11)
+        ).pack(expand=True)
+        
+        ctk.CTkButton(
+            btns, 
+            text="<< Rem", 
+            command=self._remove_selected_enrich_columns, 
+            width=60, 
+            height=32,
+            fg_color=CORPORATE_COLORS["surface_alt"],
+            text_color=CORPORATE_COLORS["navy"],
+            border_width=1,
+            border_color=CORPORATE_COLORS["border"],
+            font=("Segoe UI Semibold", 11)
+        ).pack(expand=True)
+        
+        # Initial population
+        if hasattr(self, "enrich_side_headers") and self.enrich_side_headers:
+            self._refresh_enrich_columns_ui()
+
 
     def _build_header(self):
         header = ctk.CTkFrame(
@@ -151,58 +366,65 @@ class App:
             corner_radius=10,
         ).grid(row=0, column=2, sticky="e", padx=(0, 16))
 
-    def _build_tabs(self):
-        self.tabview = ctk.CTkTabview(
-            self.content,
-            fg_color=CORPORATE_COLORS["surface"],
-            segmented_button_fg_color=CORPORATE_COLORS["surface_alt"],
-            segmented_button_selected_color=CORPORATE_COLORS["navy"],
-            segmented_button_selected_hover_color=CORPORATE_COLORS["blue"],
-            segmented_button_unselected_color=CORPORATE_COLORS["surface_alt"],
-            segmented_button_unselected_hover_color="#DCE9F4",
-            text_color=CORPORATE_COLORS["text"],
-            border_width=1,
-            border_color=CORPORATE_COLORS["border"],
-            corner_radius=24,
-        )
-        self.tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 10))
+    def _on_console_write(self, string):
+        # Background threads use print() which calls this. 
+        # We need to detect errors to update the summary bar.
+        import re
+        
+        # Increment processed count
+        if "[OK]" in string:
+            self.root.after(0, lambda: self._update_status_summary(processed=self.files_processed_count + 1))
+            
+        # Detect errors/warnings
+        if "[!]" in string or "[ERROR]" in string or "[ADVERTENCIA]" in string or "error" in string.lower():
+            filename_match = re.search(r"'(.*?)'", string) or re.search(r'archivo:\s*(.*?)[\]\s]', string, re.I)
+            fname = filename_match.group(1) if filename_match else None
+            self.root.after(0, lambda f=fname: self._update_status_summary(errors=self.files_error_count + 1, error_file=f))
 
-        main_tab = self.tabview.add("Proceso unificado")
-        main_tab.grid_columnconfigure(0, weight=1)
-        main_tab.grid_rowconfigure(0, weight=1)
-        self._create_main_process_tab(main_tab)
 
     def _build_console(self):
-        console_card = ctk.CTkFrame(
+        self.console_card = ctk.CTkFrame(
             self.content,
             fg_color=CORPORATE_COLORS["surface"],
-            corner_radius=24,
+            corner_radius=20,
             border_width=1,
             border_color=CORPORATE_COLORS["border"],
         )
-        console_card.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 24))
-        console_card.grid_columnconfigure(0, weight=1)
+        self.console_card.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 24))
+        self.console_card.grid_columnconfigure(0, weight=1)
 
-        top_row = ctk.CTkFrame(console_card, fg_color="transparent")
-        top_row.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 10))
-        top_row.grid_columnconfigure(0, weight=1)
+        # Console Header with Summary and Toggle
+        header_row = ctk.CTkFrame(self.console_card, fg_color="transparent")
+        header_row.grid(row=0, column=0, sticky="ew", padx=20, pady=10)
+        header_row.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(
-            top_row,
-            text="Registro de actividad",
-            font=ctk.CTkFont(size=18, weight="bold"),
+        self.console_summary_label = ctk.CTkLabel(
+            header_row,
+            text="Estado: Listo | 0 procesados | 0 errores",
+            font=ctk.CTkFont(size=13, weight="bold"),
             text_color=CORPORATE_COLORS["text"],
-        ).grid(row=0, column=0, sticky="w")
+        )
+        self.console_summary_label.grid(row=0, column=0, sticky="w")
 
-        ctk.CTkLabel(
-            top_row,
-            text="Salida operativa en tiempo real",
-            font=ctk.CTkFont(size=12),
-            text_color=CORPORATE_COLORS["muted"],
-        ).grid(row=1, column=0, sticky="w")
+        self.toggle_console_btn = ctk.CTkButton(
+            header_row,
+            text="▲ Expandir Log",
+            command=self._toggle_console,
+            width=120,
+            height=28,
+            fg_color=CORPORATE_COLORS["surface_alt"],
+            text_color=CORPORATE_COLORS["navy"],
+            border_width=1,
+            border_color=CORPORATE_COLORS["border"],
+        )
+        self.toggle_console_btn.grid(row=0, column=2, sticky="e")
+
+        self.console_text_container = ctk.CTkFrame(self.console_card, fg_color="transparent")
+        self.console_text_container.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        self.console_text_container.grid_columnconfigure(0, weight=1)
 
         self.console_text = ctk.CTkTextbox(
-            console_card,
+            self.console_text_container,
             height=120,
             fg_color="#0F2740",
             text_color="#D7E5F2",
@@ -211,8 +433,43 @@ class App:
             font=ctk.CTkFont(family="Consolas", size=12),
             wrap="word",
         )
-        self.console_text.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 20))
+        self.console_text.grid(row=0, column=0, sticky="ew")
         self.console_text.configure(state="disabled")
+        
+        # Start collapsed for small screens
+        self.console_is_expanded = True # Set to True so _toggle_console flips it to False
+        self._toggle_console()
+
+    def _toggle_console(self):
+        if self.console_is_expanded:
+            self.console_text_container.grid_remove()
+            self.toggle_console_btn.configure(text="▲ Ver Log Completo")
+            self.console_is_expanded = False
+        else:
+            self.console_text_container.grid()
+            self.toggle_console_btn.configure(text="▼ Contraer Log")
+            self.console_is_expanded = True
+
+    def _update_status_summary(self, status_text=None, processed=None, errors=None, error_file=None):
+        if status_text:
+            pass # We could set a separate var
+        if processed is not None:
+            self.files_processed_count = processed
+        if errors is not None:
+            self.files_error_count = errors
+        if error_file:
+            self.files_error_list.append(error_file)
+            
+        color = CORPORATE_COLORS["text"]
+        if self.files_error_count > 0:
+            color = "#E74C3C" # Red for errors
+            
+        summary = f"Total procesados: {self.files_processed_count} | Errores: {self.files_error_count}"
+        if self.files_error_list:
+            summary += f" (Último error: {os.path.basename(self.files_error_list[-1])})"
+            
+        self.console_summary_label.configure(text=summary, text_color=color)
+
 
     def _create_main_process_tab(self, parent_tab):
         scroll = ctk.CTkScrollableFrame(parent_tab, fg_color="transparent")
@@ -387,7 +644,7 @@ class App:
 
         self._file_picker_row(
             enrich_files_card,
-            "Archivo de enriquecimiento",
+            "1 - Archivo de enriquecimiento",
             self.enrich_side_file,
             self._select_enrich_file,
             "Seleccionar archivo",
@@ -402,88 +659,34 @@ class App:
         )
         keys_card.pack(fill="x", padx=20, pady=(0, 14))
 
-        self.combo_base_key = self._create_labeled_combo(
+        combo_base = self._create_labeled_combo(
             keys_card,
-            "Columna clave del consolidado",
+            "2 - Columna clave del consolidado",
             self.enrich_base_key_col,
         )
-        self.combo_side_key = self._create_labeled_combo(
+        self.all_combos_base_key.append(combo_base)
+        
+        combo_side = self._create_labeled_combo(
             keys_card,
-            "Columna clave del archivo de enriquecimiento",
+            "3 - Columna clave del archivo de enriquecimiento",
             self.enrich_side_key_col,
         )
+        self.all_combos_side_key.append(combo_side)
 
-        add_card = ctk.CTkFrame(
+        # REFACTORED: Use the common column manager component
+        self._create_column_manager_section(self.enrich_details)
+
+        # Drop columns card (remains separate or we could refactor too)
+        drop_card = ctk.CTkFrame(
             self.enrich_details,
             fg_color=CORPORATE_COLORS["surface_alt"],
             border_width=1,
             border_color=CORPORATE_COLORS["border"],
             corner_radius=14,
         )
-        add_card.pack(fill="x", padx=20, pady=(0, 14))
-
-        search_row = ctk.CTkFrame(add_card, fg_color="transparent")
-        search_row.pack(fill="x", padx=16, pady=(14, 10))
-
-        ctk.CTkLabel(
-            search_row,
-            text="Buscar columnas para agregar",
-            text_color=CORPORATE_COLORS["text"],
-            font=ctk.CTkFont(size=13, weight="bold"),
-        ).pack(anchor="w")
-
-        search_entry = ctk.CTkEntry(
-            search_row,
-            textvariable=self.enrich_col_search_var,
-            placeholder_text="Filtra por nombre de columna",
-            border_color=CORPORATE_COLORS["border"],
-            fg_color=CORPORATE_COLORS["surface"],
-            text_color=CORPORATE_COLORS["text"],
-        )
-        search_entry.pack(fill="x", pady=(8, 0))
-        search_entry.bind("<KeyRelease>", self._filter_cols_listbox)
-
-        add_lists = ctk.CTkFrame(add_card, fg_color="transparent")
-        add_lists.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        add_lists.grid_columnconfigure((0, 2), weight=1)
-        add_lists.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(add_lists, text="Disponibles", text_color=CORPORATE_COLORS["text"]).grid(
-            row=0, column=0, sticky="w", pady=(0, 6)
-        )
-        ctk.CTkLabel(add_lists, text="Se agregaran", text_color=CORPORATE_COLORS["text"]).grid(
-            row=0, column=2, sticky="w", pady=(0, 6)
-        )
-
-        self.listbox_available_add = self._create_listbox(add_lists, height=6)
-        self.listbox_available_add.grid(row=1, column=0, sticky="nsew")
-
-        self.listbox_selected_add = self._create_listbox(add_lists, height=6)
-        self.listbox_selected_add.grid(row=1, column=2, sticky="nsew")
-
-        add_actions = ctk.CTkFrame(add_lists, fg_color="transparent")
-        add_actions.grid(row=1, column=1, sticky="ns", padx=12)
-
-        ctk.CTkButton(
-            add_actions,
-            text="Agregar >",
-            command=self._add_selected_enrich_columns,
-            fg_color=CORPORATE_COLORS["green"],
-            hover_color="#27AE60",
-            width=110,
-        ).pack(pady=(30, 10))
-
-        ctk.CTkButton(
-            add_actions,
-            text="< Quitar",
-            command=self._remove_selected_enrich_columns,
-            fg_color=CORPORATE_COLORS["surface"],
-            text_color=CORPORATE_COLORS["navy"],
-            border_width=1,
-            border_color=CORPORATE_COLORS["border"],
-            hover_color="#DCE9F4",
-            width=110,
-        ).pack()
+        drop_card.pack(fill="x", padx=20, pady=(0, 14))
+        
+        # ... (rest of drop_card logic remains mostly the same but I'll skip re-outputting it all unless needed)
 
         drop_card = ctk.CTkFrame(
             self.enrich_details,
@@ -532,6 +735,8 @@ class App:
 
         self.listbox_selected_drop = self._create_listbox(drop_lists, height=5)
         self.listbox_selected_drop.grid(row=1, column=2, sticky="nsew")
+        
+        self.all_listboxes_selected.append(self.listbox_selected_drop)
 
         drop_actions = ctk.CTkFrame(drop_lists, fg_color="transparent")
         drop_actions.grid(row=1, column=1, sticky="ns", padx=12)
@@ -720,7 +925,7 @@ class App:
             self.enrich_details.pack_forget()
 
     def _create_listbox(self, parent, height):
-        return tk.Listbox(
+        lb = tk.Listbox(
             parent,
             height=height,
             selectmode=tk.EXTENDED,
@@ -736,6 +941,7 @@ class App:
             highlightcolor=CORPORATE_COLORS["blue"],
             font=("Segoe UI", 11),
         )
+        return lb
 
     def _clear_console(self):
         self.console_text.configure(state="normal")
@@ -770,15 +976,15 @@ class App:
             "Precio total cliente",
         ]
         self.enrich_base_headers = consolidated_headers
-        if hasattr(self, "combo_base_key"):
-            self.combo_base_key.configure(values=consolidated_headers)
-            if self.enrich_base_key_col.get() not in consolidated_headers:
-                self.enrich_base_key_col.set("LCL_Origen")
-        if hasattr(self, "listbox_available_drop"):
-            self.enrich_selected_drop_cols = [
-                col for col in self.enrich_selected_drop_cols if col in self.enrich_base_headers
-            ]
-            self._refresh_drop_columns_ui()
+        for combo in self.all_combos_base_key:
+            combo.configure(values=consolidated_headers)
+        if self.enrich_base_key_col.get() not in consolidated_headers:
+            self.enrich_base_key_col.set("LCL_Origen")
+        
+        self.enrich_selected_drop_cols = [
+            col for col in self.enrich_selected_drop_cols if col in self.enrich_base_headers
+        ]
+        self._refresh_drop_columns_ui()
 
     def _select_dir(self, string_var):
         dir_path = filedialog.askdirectory(title="Seleccionar Carpeta")
@@ -835,17 +1041,18 @@ class App:
         self.stage2_filter_column_combo.configure(values=headers or [""])
         enriched_headers = ["Tipo_Obra"] + headers if headers else ["Tipo_Obra"]
         self.enrich_base_headers = enriched_headers
-        if hasattr(self, "combo_base_key"):
-            self.combo_base_key.configure(values=enriched_headers)
-            if self.enrich_base_key_col.get() not in enriched_headers:
-                if "LCL_Origen" in enriched_headers:
-                    self.enrich_base_key_col.set("LCL_Origen")
-                elif enriched_headers:
-                    self.enrich_base_key_col.set(enriched_headers[0])
-            self.enrich_selected_drop_cols = [
-                col for col in self.enrich_selected_drop_cols if col in self.enrich_base_headers
-            ]
-            self._refresh_drop_columns_ui()
+        for combo in self.all_combos_base_key:
+            combo.configure(values=enriched_headers)
+        
+        if self.enrich_base_key_col.get() not in enriched_headers:
+            if "LCL_Origen" in enriched_headers:
+                self.enrich_base_key_col.set("LCL_Origen")
+            elif enriched_headers:
+                self.enrich_base_key_col.set(enriched_headers[0])
+        self.enrich_selected_drop_cols = [
+            col for col in self.enrich_selected_drop_cols if col in self.enrich_base_headers
+        ]
+        self._refresh_drop_columns_ui()
 
         if "Tipo" in headers:
             self.stage2_filter_column_var.set("Tipo")
@@ -870,9 +1077,17 @@ class App:
         self.enrich_base_file.set(file_path)
         headers = self._get_file_headers(file_path)
         self.enrich_base_headers = headers
-        self.combo_base_key.configure(values=headers or [""])
-        self.enrich_base_key_col.set(headers[0] if headers else "")
-
+        
+        # Update ALL base key combos across pages
+        for combo in self.all_combos_base_key:
+            combo.configure(values=headers or [""])
+        
+        if headers:
+            # Smart default if current selection not in new headers
+            if self.enrich_base_key_col.get() not in headers:
+                if "LCL_Origen" in headers: self.enrich_base_key_col.set("LCL_Origen")
+                else: self.enrich_base_key_col.set(headers[0])
+        
         self.enrich_selected_drop_cols = [
             col for col in self.enrich_selected_drop_cols if col in self.enrich_base_headers
         ]
@@ -889,7 +1104,11 @@ class App:
         self.enrich_side_file.set(file_path)
         headers = self._get_file_headers(file_path)
         self.enrich_side_headers = headers
-        self.combo_side_key.configure(values=headers or [""])
+        
+        # Update ALL side key combos across pages
+        for combo in self.all_combos_side_key:
+            combo.configure(values=headers or [""])
+            
         self.enrich_side_key_col.set(headers[0] if headers else "")
 
         self.enrich_selected_add_cols = [col for col in self.enrich_selected_add_cols if col in self.enrich_side_headers]
@@ -906,8 +1125,17 @@ class App:
                 continue
             available.append(header)
 
-        self._populate_listbox(self.listbox_available_add, available)
-        self._populate_listbox(self.listbox_selected_add, self.enrich_selected_add_cols)
+        # Sync all listboxes across different pages
+        lbs_add = [getattr(self, "listbox_available_add", None)]
+        if hasattr(self, "all_listboxes_add"): lbs_add.extend(self.all_listboxes_add)
+        
+        lbs_sel = [getattr(self, "listbox_selected_add", None)]
+        if hasattr(self, "all_listboxes_selected"): lbs_sel.extend(self.all_listboxes_selected)
+
+        for lb in lbs_add:
+            if lb: self._populate_listbox(lb, available)
+        for lb in lbs_sel:
+            if lb: self._populate_listbox(lb, self.enrich_selected_add_cols)
 
     def _refresh_drop_columns_ui(self):
         search_term = self.drop_col_search_var.get().strip().lower()
@@ -928,14 +1156,29 @@ class App:
         self._refresh_drop_columns_ui()
 
     def _add_selected_enrich_columns(self):
-        selected = [self.listbox_available_add.get(i) for i in self.listbox_available_add.curselection()]
-        for col in selected:
+        selected = []
+        # Check all possible listboxes
+        all_lbs = [getattr(self, "listbox_available_add", None)]
+        if hasattr(self, "all_listboxes_add"): all_lbs.extend(self.all_listboxes_add)
+        
+        for lb in all_lbs:
+            if lb:
+                selected.extend([lb.get(i) for i in lb.curselection()])
+                
+        for col in list(set(selected)): # Unique
             if col not in self.enrich_selected_add_cols:
                 self.enrich_selected_add_cols.append(col)
         self._refresh_enrich_columns_ui()
 
     def _remove_selected_enrich_columns(self):
-        selected = [self.listbox_selected_add.get(i) for i in self.listbox_selected_add.curselection()]
+        selected = []
+        all_lbs = [getattr(self, "listbox_selected_add", None)]
+        if hasattr(self, "all_listboxes_selected"): all_lbs.extend(self.all_listboxes_selected)
+        
+        for lb in all_lbs:
+            if lb:
+                selected.extend([lb.get(i) for i in lb.curselection()])
+
         self.enrich_selected_add_cols = [col for col in self.enrich_selected_add_cols if col not in selected]
         self._refresh_enrich_columns_ui()
 
