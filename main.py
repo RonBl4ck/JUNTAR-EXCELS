@@ -1,5 +1,6 @@
 import glob
 import os
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -52,6 +53,122 @@ class ConsoleRedirector:
 
     def flush(self):
         pass
+
+
+class SheetSelectorDialog(ctk.CTkToplevel):
+    """Custom dialog to select a sheet from an Excel file."""
+
+    def __init__(self, parent, filename, options, result_queue):
+        super().__init__(parent)
+        self.filename = os.path.basename(filename)
+        self.options = options
+        self.result_queue = result_queue
+        self.selected_sheet = tk.StringVar(value="")
+
+        self.title(f"Seleccionar Hoja - {self.filename}")
+        self.geometry("560x420")
+        self.resizable(False, False)
+        self.grab_set()  # Modal
+        
+        # Center in parent
+        self._center_window(parent)
+
+        self.configure(fg_color=CORPORATE_COLORS["bg"])
+        
+        # Header
+        header = ctk.CTkFrame(self, fg_color=CORPORATE_COLORS["navy"], height=60, corner_radius=0)
+        header.pack(fill="x")
+        
+        ctk.CTkLabel(
+            header, 
+            text="Multiples Hojas Detectadas", 
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="white"
+        ).pack(pady=15)
+
+        # Content
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=30, pady=20)
+
+        ctk.CTkLabel(
+            content,
+            text=f"El archivo '{self.filename}' contiene mas de una hoja con tablas validas.\nElija cual desea procesar:",
+            font=ctk.CTkFont(size=13),
+            text_color=CORPORATE_COLORS["text"],
+            justify="left"
+        ).pack(anchor="w", pady=(0, 15))
+
+        # List Container
+        list_frame = ctk.CTkFrame(content, fg_color=CORPORATE_COLORS["surface"], border_width=1, border_color=CORPORATE_COLORS["border"])
+        list_frame.pack(fill="both", expand=True, pady=10)
+
+        # Build list with RadioButtons
+        scroll = ctk.CTkScrollableFrame(list_frame, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        first = True
+        for sheet_name, row_count in sorted(self.options.items()):
+            display_text = f"{sheet_name} ({row_count} filas)"
+            rb = ctk.CTkRadioButton(
+                scroll,
+                text=display_text,
+                variable=self.selected_sheet,
+                value=sheet_name,
+                fg_color=CORPORATE_COLORS["blue"],
+                hover_color=CORPORATE_COLORS["navy"],
+                font=ctk.CTkFont(size=12)
+            )
+            rb.pack(anchor="w", padx=20, pady=8)
+            if first:
+                self.selected_sheet.set(sheet_name)
+                first = False
+
+        # Footer
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=30, pady=20)
+
+        ctk.CTkButton(
+            footer,
+            text="Confirmar Seleccion",
+            command=self._confirm,
+            fg_color=CORPORATE_COLORS["green"],
+            hover_color="#27AE60",
+            height=38,
+            font=ctk.CTkFont(weight="bold")
+        ).pack(side="right", padx=5)
+
+        ctk.CTkButton(
+            footer,
+            text="Omitir Archivo",
+            command=self._cancel,
+            fg_color=CORPORATE_COLORS["surface_alt"],
+            text_color=CORPORATE_COLORS["navy"],
+            hover_color="#DCE9F4",
+            border_width=1,
+            border_color=CORPORATE_COLORS["border"],
+            height=38
+        ).pack(side="right", padx=5)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _center_window(self, parent):
+        self.update_idletasks()
+        parent_x = parent.winfo_rootx()
+        parent_y = parent.winfo_rooty()
+        parent_w = parent.winfo_width()
+        parent_h = parent.winfo_height()
+        
+        x = parent_x + (parent_w // 2) - (self.winfo_width() // 2)
+        y = parent_y + (parent_h // 2) - (self.winfo_height() // 2)
+        self.geometry(f"+{x}+{y}")
+
+    def _confirm(self):
+        self.result_queue.put(self.selected_sheet.get())
+        self.destroy()
+
+    def _cancel(self):
+        self.result_queue.put(None)
+        self.destroy()
 
 
 class App:
@@ -959,6 +1076,25 @@ class App:
 
         self.root.after(0, _callback)
 
+    def _ask_sheet_selection(self, filename, options):
+        """
+        Synchronously asks the user to select a sheet from a list of options.
+        Called from a background thread.
+        """
+        result_queue = queue.Queue()
+
+        def _open_dialog():
+            dialog = SheetSelectorDialog(self.root, filename, options, result_queue)
+            # The dialog is modal (grab_set), so it will block interaction with the main window
+            # but _open_dialog itself returns immediately. 
+            # The background thread waits on the queue.
+
+        self.root.after(0, _open_dialog)
+        
+        # Wait for the result from the dialog
+        selection = result_queue.get() 
+        return selection
+
     def _sync_unified_base_headers(self):
         consolidated_headers = [
             "Tipo_Obra",
@@ -1362,6 +1498,7 @@ class App:
             filter_column=filter_column,
             allowed_values=allowed_values,
             enrich_config=enrich_config,
+            sheet_selector_callback=self._ask_sheet_selection
         )
         if success:
             self._show_message("info", "Exito", f"Proceso unificado completado. Archivo guardado en:\n{output_path}")
@@ -1390,7 +1527,10 @@ class App:
         ).start()
 
     def _process_stage1_thread(self, input_dir, output_dir, output_numeric_format):
-        processed_folders, success = logic.process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format)
+        processed_folders, success = logic.process_stage1_by_subfolders(
+            input_dir, output_dir, output_numeric_format,
+            sheet_selector_callback=self._ask_sheet_selection
+        )
 
         if self.clean_folder_var.get() and processed_folders:
             print("\n--- Limpiando subcarpetas procesadas ---")

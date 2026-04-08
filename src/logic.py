@@ -275,14 +275,46 @@ def _apply_numeric_output_format(df, output_numeric_format, numeric_columns=None
     return df
 
 
-def extract_table_from_file(file_path, lcl_name):
+def _find_rows_in_df(df, lcl_name, expected_cols_count=11):
+    """Auxiliary function to find and extract rows from a DataFrame."""
+    found_rows = []
+    if df.shape[1] < 2:
+        return found_rows
+
+    i = 0
+    while i < len(df):
+        try:
+            cell_b = df.iloc[i, 1]
+        except IndexError:
+            i += 1
+            continue
+
+        if isinstance(cell_b, str) and str(cell_b).strip() == "Tipo":
+            if df.shape[1] < 1 + expected_cols_count:
+                i += 1
+                continue
+
+            current_row = i + 1
+            while current_row < len(df):
+                val_b = df.iloc[current_row, 1]
+                if pd.isna(val_b) or str(val_b).strip() == "":
+                    break
+
+                raw_data = df.iloc[current_row, 1 : 1 + expected_cols_count].tolist()
+                found_rows.append([lcl_name] + raw_data)
+                current_row += 1
+            i = current_row
+            continue
+        i += 1
+    return found_rows
+
+
+def extract_table_from_file(file_path, lcl_name, sheet_selector_callback=None):
     """
     Finds the row where column B (index 1) is 'Tipo' and extracts data.
-    Handles both Excel and CSV files.
+    Handles both Excel and CSV files. Supports sheet selection if multiple valid sheets exist.
     """
-    found_rows = []
     errors = []
-    expected_cols_count = 11
     file_ext = os.path.splitext(file_path)[1].lower()
 
     try:
@@ -301,83 +333,50 @@ def extract_table_from_file(file_path, lcl_name):
                         )
                         return [], errors
 
-            if df.shape[1] < 2:
-                return [], errors
-
-            i = 0
-            while i < len(df):
-                try:
-                    cell_b = df.iloc[i, 1]
-                except IndexError:
-                    i += 1
-                    continue
-
-                if isinstance(cell_b, str) and str(cell_b).strip() == "Tipo":
-                    if df.shape[1] < 1 + expected_cols_count:
-                        i += 1
-                        continue
-
-                    current_row = i + 1
-                    while current_row < len(df):
-                        val_b = df.iloc[current_row, 1]
-                        if pd.isna(val_b) or str(val_b).strip() == "":
-                            break
-
-                        raw_data = df.iloc[current_row, 1 : 1 + expected_cols_count].tolist()
-                        found_rows.append([lcl_name] + raw_data)
-                        current_row += 1
-                    i = current_row
-                    continue
-                i += 1
+            return _find_rows_in_df(df, lcl_name), errors
 
         elif file_ext in [".xlsx", ".xls"]:
             xls = pd.ExcelFile(file_path)
+            sheets_with_data = {}
+            
             for sheet_name in xls.sheet_names:
                 try:
                     df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-
-                    if df.shape[1] < 2:
-                        continue
-
-                    i = 0
-                    while i < len(df):
-                        try:
-                            cell_b = df.iloc[i, 1]
-                        except IndexError:
-                            i += 1
-                            continue
-
-                        if isinstance(cell_b, str) and str(cell_b).strip() == "Tipo":
-                            if df.shape[1] < 1 + expected_cols_count:
-                                i += 1
-                                continue
-
-                            current_row = i + 1
-                            while current_row < len(df):
-                                val_b = df.iloc[current_row, 1]
-                                if pd.isna(val_b) or str(val_b).strip() == "":
-                                    break
-
-                                raw_data = df.iloc[current_row, 1 : 1 + expected_cols_count].tolist()
-                                found_rows.append([lcl_name] + raw_data)
-                                current_row += 1
-                            i = current_row
-                            continue
-                        i += 1
-
+                    rows = _find_rows_in_df(df, lcl_name)
+                    if rows:
+                        sheets_with_data[sheet_name] = rows
                 except Exception as e:
-                    errors.append(
-                        f"Warning: Error reading sheet '{sheet_name}': {e}"
-                    )
+                    errors.append(f"Warning: Error reading sheet '{sheet_name}': {e}")
+
+            if not sheets_with_data:
+                return [], errors
+
+            # If only one sheet has data, auto-pick it
+            if len(sheets_with_data) == 1:
+                return list(sheets_with_data.values())[0], errors
+
+            # Multiple sheets have data -> Use callback if provided
+            if sheet_selector_callback:
+                options = {name: len(data) for name, data in sheets_with_data.items()}
+                selected_sheet = sheet_selector_callback(file_path, options)
+                if selected_sheet in sheets_with_data:
+                    return sheets_with_data[selected_sheet], errors
+                else:
+                    # User cancelled or selected nothing
+                    return [], errors
+
+            # Fallback if no callback: take the first one found
+            return list(sheets_with_data.values())[0], errors
 
     except Exception as e:
-        errors.append(f"Error reading file: {e}")
+        errors.append(f"Error reading file {os.path.basename(file_path)}: {e}")
         return [], errors
 
-    return found_rows, errors
+    return [], errors
 
 
-def _build_batch_dataframe(batch_name, folder_path):
+def _build_batch_dataframe(batch_name, folder_path, sheet_selector_callback=None):
+    """Processes all files in a folder and handles the sheet selection if needed."""
     stage1_log = []
     relative_error_log = []
 
@@ -407,7 +406,7 @@ def _build_batch_dataframe(batch_name, folder_path):
         else:
             lcl_name = name_no_ext.split("-")[0].strip()
 
-        rows, file_errors = extract_table_from_file(file_path, lcl_name)
+        rows, file_errors = extract_table_from_file(file_path, lcl_name, sheet_selector_callback)
         if file_errors:
             for error in file_errors:
                 stage1_log.append(f"[Lote: {batch_name} | Archivo: {filename}] {error}")
@@ -470,7 +469,8 @@ def _build_batch_dataframe(batch_name, folder_path):
     return df_batch, stage1_log, relative_error_log
 
 
-def _collect_batches_from_subfolders(input_dir):
+def _collect_batches_from_subfolders(input_dir, sheet_selector_callback=None):
+    """Iterates through subfolders and processes each as a batch."""
     subfolders = [f.path for f in os.scandir(input_dir) if f.is_dir()]
     stage1_log = []
     relative_error_log = []
@@ -486,7 +486,9 @@ def _collect_batches_from_subfolders(input_dir):
     for folder_path in subfolders:
         batch_name = os.path.basename(folder_path)
         print(f"\n--- Procesando Lote: {batch_name} ---")
-        df_batch, batch_log, batch_relative_log = _build_batch_dataframe(batch_name, folder_path)
+        df_batch, batch_log, batch_relative_log = _build_batch_dataframe(
+            batch_name, folder_path, sheet_selector_callback
+        )
         stage1_log.extend(batch_log)
         relative_error_log.extend(batch_relative_log)
 
@@ -500,13 +502,13 @@ def _collect_batches_from_subfolders(input_dir):
     return batch_dfs, processed_folders, stage1_log, relative_error_log, overall_success
 
 
-def process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format="excel"):
+def process_stage1_by_subfolders(input_dir, output_dir, output_numeric_format="excel", sheet_selector_callback=None):
     """
     Stage 1: Find subfolders in input_dir and process each as a batch.
     Returns a list of successfully processed folder paths for cleaning.
     """
     batch_dfs, successfully_processed_folders, stage1_log, relative_error_log, overall_success = _collect_batches_from_subfolders(
-        input_dir
+        input_dir, sheet_selector_callback
     )
 
     for batch_name, df_batch in batch_dfs:
@@ -789,9 +791,10 @@ def run_unified_process(
     allowed_values=None,
     enrich_config=None,
     save_batches_dir=None,
+    sheet_selector_callback=None,
 ):
     batch_dfs, _, stage1_log, relative_error_log, overall_success = _collect_batches_from_subfolders(
-        input_dir
+        input_dir, sheet_selector_callback
     )
 
     if not overall_success:
