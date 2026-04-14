@@ -358,9 +358,17 @@ def extract_table_from_file(file_path, lcl_name, sheet_selector_callback=None):
             # Multiple sheets have data -> Use callback if provided
             if sheet_selector_callback:
                 options = {name: len(data) for name, data in sheets_with_data.items()}
-                selected_sheet = sheet_selector_callback(file_path, options)
-                if selected_sheet in sheets_with_data:
-                    return sheets_with_data[selected_sheet], errors
+                selection = sheet_selector_callback(file_path, options)
+                
+                # selection can be a list of sheet names or a single sheet name
+                if isinstance(selection, list):
+                    all_selected_rows = []
+                    for s_name in selection:
+                        if s_name in sheets_with_data:
+                            all_selected_rows.extend(sheets_with_data[s_name])
+                    return all_selected_rows, errors
+                elif selection in sheets_with_data:
+                    return sheets_with_data[selection], errors
                 else:
                     # User cancelled or selected nothing
                     return [], errors

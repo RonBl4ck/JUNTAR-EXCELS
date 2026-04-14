@@ -63,10 +63,10 @@ class SheetSelectorDialog(ctk.CTkToplevel):
         self.filename = os.path.basename(filename)
         self.options = options
         self.result_queue = result_queue
-        self.selected_sheet = tk.StringVar(value="")
+        self.sheet_vars = {} # Dictionary to store BooleanVar for each sheet
 
         self.title(f"Seleccionar Hoja - {self.filename}")
-        self.geometry("560x420")
+        self.geometry("560x480") # Increased height slightly for more buttons
         self.resizable(False, False)
         self.grab_set()  # Modal
         
@@ -77,7 +77,7 @@ class SheetSelectorDialog(ctk.CTkToplevel):
         
         # Header
         header = ctk.CTkFrame(self, fg_color=CORPORATE_COLORS["navy"], height=60, corner_radius=0)
-        header.pack(fill="x")
+        header.pack(fill="x", side="top")
         
         ctk.CTkLabel(
             header, 
@@ -86,46 +86,9 @@ class SheetSelectorDialog(ctk.CTkToplevel):
             text_color="white"
         ).pack(pady=15)
 
-        # Content
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.pack(fill="both", expand=True, padx=30, pady=20)
-
-        ctk.CTkLabel(
-            content,
-            text=f"El archivo '{self.filename}' contiene mas de una hoja con tablas validas.\nElija cual desea procesar:",
-            font=ctk.CTkFont(size=13),
-            text_color=CORPORATE_COLORS["text"],
-            justify="left"
-        ).pack(anchor="w", pady=(0, 15))
-
-        # List Container
-        list_frame = ctk.CTkFrame(content, fg_color=CORPORATE_COLORS["surface"], border_width=1, border_color=CORPORATE_COLORS["border"])
-        list_frame.pack(fill="both", expand=True, pady=10)
-
-        # Build list with RadioButtons
-        scroll = ctk.CTkScrollableFrame(list_frame, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=5, pady=5)
-
-        first = True
-        for sheet_name, row_count in sorted(self.options.items()):
-            display_text = f"{sheet_name} ({row_count} filas)"
-            rb = ctk.CTkRadioButton(
-                scroll,
-                text=display_text,
-                variable=self.selected_sheet,
-                value=sheet_name,
-                fg_color=CORPORATE_COLORS["blue"],
-                hover_color=CORPORATE_COLORS["navy"],
-                font=ctk.CTkFont(size=12)
-            )
-            rb.pack(anchor="w", padx=20, pady=8)
-            if first:
-                self.selected_sheet.set(sheet_name)
-                first = False
-
-        # Footer
+        # Footer (Packed before content to ensure visibility at the bottom)
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.pack(fill="x", padx=30, pady=20)
+        footer.pack(fill="x", side="bottom", padx=30, pady=20)
 
         ctk.CTkButton(
             footer,
@@ -149,6 +112,73 @@ class SheetSelectorDialog(ctk.CTkToplevel):
             height=38
         ).pack(side="right", padx=5)
 
+        # Selection actions
+        actions_frame = ctk.CTkFrame(self, fg_color="transparent")
+        actions_frame.pack(fill="x", side="bottom", padx=30, pady=(0, 10))
+
+        ctk.CTkButton(
+            actions_frame,
+            text="Seleccionar Todo",
+            command=self._select_all,
+            fg_color=CORPORATE_COLORS["surface_alt"],
+            text_color=CORPORATE_COLORS["navy"],
+            hover_color="#DCE9F4",
+            border_width=1,
+            border_color=CORPORATE_COLORS["border"],
+            height=30,
+            width=140,
+            font=ctk.CTkFont(size=11)
+        ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            actions_frame,
+            text="Desmarcar Todo",
+            command=self._deselect_all,
+            fg_color=CORPORATE_COLORS["surface_alt"],
+            text_color=CORPORATE_COLORS["navy"],
+            hover_color="#DCE9F4",
+            border_width=1,
+            border_color=CORPORATE_COLORS["border"],
+            height=30,
+            width=140,
+            font=ctk.CTkFont(size=11)
+        ).pack(side="left", padx=5)
+
+        # Content (Packed last with expand=True to fill middle space)
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=30, pady=(10, 0))
+
+        ctk.CTkLabel(
+            content,
+            text=f"El archivo '{self.filename}' contiene mas de una hoja con tablas validas.\nElija cual desea procesar:",
+            font=ctk.CTkFont(size=13),
+            text_color=CORPORATE_COLORS["text"],
+            justify="left"
+        ).pack(anchor="w", pady=(0, 15))
+
+        # List Container
+        list_frame = ctk.CTkFrame(content, fg_color=CORPORATE_COLORS["surface"], border_width=1, border_color=CORPORATE_COLORS["border"])
+        list_frame.pack(fill="both", expand=True, pady=10)
+
+        # Build list with CheckBoxes
+        scroll = ctk.CTkScrollableFrame(list_frame, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        for sheet_name, row_count in sorted(self.options.items()):
+            display_text = f"{sheet_name} ({row_count} filas)"
+            var = tk.BooleanVar(value=True) # Default select all found
+            self.sheet_vars[sheet_name] = var
+            
+            cb = ctk.CTkCheckBox(
+                scroll,
+                text=display_text,
+                variable=var,
+                fg_color=CORPORATE_COLORS["blue"],
+                hover_color=CORPORATE_COLORS["navy"],
+                font=ctk.CTkFont(size=12)
+            )
+            cb.pack(anchor="w", padx=20, pady=8)
+
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _center_window(self, parent):
@@ -162,8 +192,20 @@ class SheetSelectorDialog(ctk.CTkToplevel):
         y = parent_y + (parent_h // 2) - (self.winfo_height() // 2)
         self.geometry(f"+{x}+{y}")
 
+    def _select_all(self):
+        for var in self.sheet_vars.values():
+            var.set(True)
+
+    def _deselect_all(self):
+        for var in self.sheet_vars.values():
+            var.set(False)
+
     def _confirm(self):
-        self.result_queue.put(self.selected_sheet.get())
+        selected = [name for name, var in self.sheet_vars.items() if var.get()]
+        if not selected:
+            messagebox.showwarning("Sin seleccion", "Por favor seleccione al menos una hoja o elija 'Omitir Archivo'.")
+            return
+        self.result_queue.put(selected)
         self.destroy()
 
     def _cancel(self):
